@@ -112,6 +112,8 @@ describe("DesktopEnvironment", () => {
       );
 
       assert.equal(environment.isDevelopment, false);
+      assert.equal(environment.userDataDirName, "t3code-vas");
+      assert.equal(environment.legacyUserDataDirName, "T3 Code (Vas)");
       assert.equal(environment.stateDir, "/tmp/t3/userdata");
       assert.equal(environment.logDir, "/tmp/t3/userdata/logs");
       assert.equal(environment.browserArtifactsDir, "/tmp/t3/userdata/browser-artifacts");
@@ -163,8 +165,21 @@ describe("DesktopEnvironment", () => {
       );
       const production = yield* makeEnvironment();
 
-      assert.equal(development.stateDir, "/Users/alice/.t3/dev");
-      assert.equal(production.stateDir, "/Users/alice/.t3/userdata");
+      assert.equal(development.stateDir, "/Users/alice/.t3-vas/dev");
+      assert.equal(production.stateDir, "/Users/alice/.t3-vas/userdata");
+    }),
+  );
+
+  it.effect("disables release updates by default and preserves explicit overrides", () =>
+    Effect.gen(function* () {
+      const defaults = yield* DesktopConfig.DesktopConfig.pipe(
+        Effect.provide(DesktopConfig.layerTest({})),
+      );
+      const override = yield* DesktopConfig.DesktopConfig.pipe(
+        Effect.provide(DesktopConfig.layerTest({ T3CODE_DISABLE_AUTO_UPDATE: "false" })),
+      );
+      assert.equal(defaults.disableAutoUpdate, true);
+      assert.equal(override.disableAutoUpdate, false);
     }),
   );
 

@@ -195,6 +195,7 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
     );
 
   return {
+    forks: repository.forks,
     upsert,
     recordImportedTranscript,
     getProvider,

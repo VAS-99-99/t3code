@@ -134,11 +134,22 @@ export function codexRateLimitsToLimits(input: {
   };
 }
 
+/** `runtime.error` code for a turn Codex stopped with `usageLimitExceeded`. */
+export const USAGE_LIMIT_EXCEEDED_CODE = "usage_limit_exceeded";
+
+/**
+ * `rateLimitReachedType` is Codex's own statement that the account hit a
+ * limit (window, workspace spend or depleted credits). Windows may all read
+ * below 100% for the credit cases, so the flag, not the bars, says it is blocked.
+ */
 export function codexRateLimitsToUpdate(
   snapshot: CodexRateLimitSnapshot,
 ): ProviderUsageLimitsUpdate | undefined {
   const windows = codexRateLimitsToWindows(snapshot);
-  return windows.length > 0 ? { windows } : undefined;
+  // A sparse update that only names the limit carries no windows and emits
+  // nothing; the failed turn's `usage_limit_exceeded` code is the signal then.
+  if (windows.length === 0) return undefined;
+  return { windows, ...(snapshot.rateLimitReachedType != null ? { blocked: true } : {}) };
 }
 
 /**

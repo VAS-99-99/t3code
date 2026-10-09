@@ -634,6 +634,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             pinOrderKey: null,
             activeOrderKey: null,
             autoSettleDisabledAt: null,
+            automaticRecovery: event.payload.automaticRecovery === true ? 1 : 0,
             titleRegenerationRequestId: null,
             titleRegenerationStartedAt: null,
             latestUserMessageAt: null,
@@ -793,6 +794,21 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* projectionThreadRepository.upsert({
             ...existingRow.value,
             autoSettleDisabledAt: event.payload.autoSettleDisabledAt,
+            updatedAt: event.payload.updatedAt,
+          });
+          return;
+        }
+
+        case "thread.recovery-set": {
+          const existingRow = yield* projectionThreadRepository.getById({
+            threadId: event.payload.threadId,
+          });
+          if (Option.isNone(existingRow)) {
+            return;
+          }
+          yield* projectionThreadRepository.upsert({
+            ...existingRow.value,
+            automaticRecovery: event.payload.enabled ? 1 : 0,
             updatedAt: event.payload.updatedAt,
           });
           return;

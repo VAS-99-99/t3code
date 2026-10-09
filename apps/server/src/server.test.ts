@@ -6257,6 +6257,45 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("keeps thread fork failures structured and gated by the operate scope", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const input = {
+        sourceThreadId: ThreadId.make("missing-fork-source"),
+        destinationThreadId: ThreadId.make("fork-destination"),
+        commandId: CommandId.make("fork-command"),
+      };
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const failure = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) => client[WS_METHODS.threadsFork](input).pipe(Effect.flip)),
+      );
+      assert.equal(failure._tag, "ThreadForkError");
+      if (failure._tag === "ThreadForkError") {
+        assert.equal(failure.reason, "source-not-found");
+        assert.equal(failure.destinationThreadId, input.destinationThreadId);
+      }
+
+      const token = yield* exchangeAccessToken(defaultDesktopBootstrapToken, {
+        scope: "orchestration:read",
+      });
+      const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+        headers: { authorization: `Bearer ${token.body.access_token ?? ""}` },
+      });
+      const { ticket } = yield* responseJsonEffect<{ readonly ticket: string }>(ticketResponse);
+      const readOnlyUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(ticket)}`;
+      const denied = yield* Effect.scoped(
+        withWsRpcClient(readOnlyUrl, (client) =>
+          client[WS_METHODS.threadsFork](input).pipe(Effect.flip),
+        ),
+      );
+      assert.equal(denied._tag, "EnvironmentAuthorizationError");
+      if (denied._tag === "EnvironmentAuthorizationError") {
+        assert.equal(denied.requiredScope, "orchestration:operate");
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("returns scanner skip counts over websocket rpc", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

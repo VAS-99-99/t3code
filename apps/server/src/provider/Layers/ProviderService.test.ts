@@ -16,6 +16,7 @@ import {
   ASSISTANT_CITATION_MAX_TEXT_LENGTH,
   AssistantCitation,
   ApprovalRequestId,
+  CommandId,
   EnvironmentId,
   EventId,
   MessageId,
@@ -60,7 +61,11 @@ import {
   ProviderWorkspaceMissingError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterShape,
+  ProviderForkThreadInput,
+  ProviderForkThreadResult,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -270,11 +275,23 @@ function makeFakeCodexAdapter(
     }),
   );
 
+  const forkThread = vi.fn(
+    (
+      input: ProviderForkThreadInput,
+    ): Effect.Effect<ProviderForkThreadResult, ProviderAdapterError> =>
+      Effect.succeed({
+        resumeCursor: {
+          opaque: `fork-of-${String(input.sourceThreadId)}-${forkThread.mock.calls.length}`,
+        },
+      }),
+  );
+
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
     capabilities: {
       sessionModelSwitch: "in-session",
       ...(supportsConversationRollback !== undefined ? { supportsConversationRollback } : {}),
+      ...(provider === CURSOR_DRIVER ? {} : { supportsConversationFork: true }),
       ...(provider === CODEX_DRIVER ? { promptlessTurnContinuation: true } : {}),
     },
     startSession,
@@ -294,6 +311,7 @@ function makeFakeCodexAdapter(
     hasSession,
     readThread,
     rollbackThread,
+    ...(provider === CURSOR_DRIVER ? {} : { forkThread }),
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
@@ -331,6 +349,7 @@ function makeFakeCodexAdapter(
     hasSession,
     readThread,
     rollbackThread,
+    forkThread,
     uploadFeedback,
     stopAll,
   };
@@ -5356,6 +5375,662 @@ chatGptTelemetry.layer("ChatGPT connector turn analytics", (it) => {
         subscriptionSharing: true,
         errorType: "ProviderAdapterSessionNotFoundError",
       });
+    }),
+  );
+});
+
+const conversationFork = makeProviderServiceLayer();
+const SOURCE_FORK_THREAD = asThreadId("fork-source");
+const FORK_COMMAND = CommandId.make("fork-command-1");
+const sourceBinding = (
+  overrides: Partial<ProviderSessionDirectory.ProviderRuntimeBinding> = {},
+): ProviderSessionDirectory.ProviderRuntimeBinding => ({
+  threadId: SOURCE_FORK_THREAD,
+  provider: CODEX_DRIVER,
+  providerInstanceId: codexInstanceId,
+  status: "stopped",
+  runtimeMode: "approval-required",
+  resumeCursor: { opaque: "native-source" },
+  runtimePayload: {
+    cwd: "/tmp/fork-workspace",
+    modelSelection: { instanceId: codexInstanceId, model: "gpt-5.3-codex" },
+    activeTurnId: null,
+  },
+  ...overrides,
+});
+
+conversationFork.layer("ProviderService conversation fork", (it) => {
+  it.effect("forks after a completed facade turn without reopening the session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const source = asThreadId("fork-after-normal-completion");
+      yield* provider.startSession(source, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: source,
+        cwd: fixtureCwd("fork-after-normal-completion"),
+        runtimeMode: "approval-required",
+      });
+      const turn = yield* provider.sendTurn({ threadId: source, input: "finish this turn" });
+      conversationFork.codex.updateSession(source, (session) => ({
+        ...session,
+        status: "running",
+        activeTurnId: turn.turnId,
+      }));
+      const completion = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === source && event.type === "turn.completed"),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      conversationFork.codex.updateSession(source, (session) => ({
+        ...session,
+        status: "ready",
+        activeTurnId: undefined,
+      }));
+      conversationFork.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("fork-normal-completion"),
+        provider: CODEX_DRIVER,
+        threadId: source,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        payload: { state: "completed" },
+      });
+      assert(Option.isSome(yield* Fiber.join(completion)));
+      const binding = Option.getOrThrow(yield* directory.getBinding(source));
+      assert.propertyVal(binding.runtimePayload, "activeTurnId", turn.turnId);
+      assert.deepStrictEqual(
+        yield* provider.forkConversation({
+          sourceThreadId: source,
+          destinationThreadId: asThreadId("fork-after-completion-child"),
+          commandId: FORK_COMMAND,
+          capture: Effect.succeed(null),
+        }),
+        { created: true, captured: null },
+      );
+    }),
+  );
+
+  it.effect(
+    "admits live ready Codex and stopped history, but rejects pending, parked, starting and absent-live running sources",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const idle = asThreadId("fork-live-idle-codex");
+        yield* directory.upsert(sourceBinding({ threadId: idle }));
+        yield* provider.startSession(idle, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId: idle,
+          cwd: fixtureCwd("fork-live-idle-codex"),
+          runtimeMode: "approval-required",
+        });
+        const open = Option.getOrThrow(yield* directory.getBinding(idle));
+        assert.equal(open.status, "running");
+        assert.deepStrictEqual(
+          yield* provider.forkConversation({
+            sourceThreadId: idle,
+            destinationThreadId: asThreadId("fork-live-idle-child"),
+            commandId: FORK_COMMAND,
+            capture: Effect.succeed(null),
+          }),
+          { created: true, captured: null },
+        );
+
+        const calls = conversationFork.codex.forkThread.mock.calls.length;
+        // Persisted active ids include turns parked on approval or user input.
+        for (const [name, status, activeTurnId, live] of [
+          ["pending", "running", asTurnId("pending-turn"), true],
+          ["parked", "stopped", asTurnId("parked-turn"), false],
+          ["starting", "starting", null, true],
+          ["absent-live", "running", null, false],
+        ] as const) {
+          const source = asThreadId(`fork-state-${name}`);
+          yield* directory.upsert(sourceBinding({ threadId: source }));
+          if (live)
+            yield* provider.startSession(source, {
+              provider: CODEX_DRIVER,
+              providerInstanceId: codexInstanceId,
+              threadId: source,
+              cwd: fixtureCwd(`fork-state-${name}`),
+              runtimeMode: "approval-required",
+            });
+          yield* directory.upsert({
+            threadId: source,
+            provider: CODEX_DRIVER,
+            status,
+            runtimePayload: { activeTurnId },
+          });
+          if (live && activeTurnId !== null) {
+            conversationFork.codex.updateSession(source, (session) => ({
+              ...session,
+              status: "running",
+              activeTurnId,
+            }));
+          }
+          const destination = asThreadId(`${source}-child`);
+          const failure = yield* provider
+            .forkConversation({
+              sourceThreadId: source,
+              destinationThreadId: destination,
+              commandId: FORK_COMMAND,
+              capture: Effect.succeed(null),
+            })
+            .pipe(Effect.flip);
+          assert.equal(failure._tag, "ProviderValidationError");
+          assert.equal(Option.isNone(yield* directory.forks!.get(destination)), true);
+        }
+        assert.equal(conversationFork.codex.forkThread.mock.calls.length, calls);
+      }),
+  );
+
+  it.effect(
+    "serializes direct facade forks for the same destination across different sources",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const source = asThreadId("fork-concurrent-source");
+        const other = asThreadId("fork-concurrent-other-source");
+        const destination = asThreadId("fork-concurrent-destination");
+        yield* directory.upsert(sourceBinding({ threadId: source }));
+        yield* directory.upsert(sourceBinding({ threadId: other }));
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const calls = conversationFork.codex.forkThread.mock.calls.length;
+        let competingCaptures = 0;
+        const first = yield* provider
+          .forkConversation({
+            sourceThreadId: source,
+            destinationThreadId: destination,
+            commandId: FORK_COMMAND,
+            capture: Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as({ boundary: "first" }),
+            ),
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        const second = yield* provider
+          .forkConversation({
+            sourceThreadId: other,
+            destinationThreadId: destination,
+            commandId: CommandId.make("competing-fork"),
+            capture: Effect.sync(() => ({ boundary: ++competingCaptures })),
+          })
+          .pipe(Effect.flip, Effect.forkChild);
+        for (let turn = 0; turn < 50; turn += 1) yield* Effect.yieldNow;
+        assert.equal(competingCaptures, 0);
+        yield* Deferred.succeed(release, undefined);
+        assert.deepStrictEqual(yield* Fiber.join(first), {
+          created: true,
+          captured: { boundary: "first" },
+        });
+        assert.equal((yield* Fiber.join(second))._tag, "ProviderValidationError");
+        assert.equal(conversationFork.codex.forkThread.mock.calls.length, calls + 1);
+        assert.equal(competingCaptures, 0);
+        const staged = Option.getOrThrow(yield* directory.forks!.get(destination));
+        assert.equal(staged.sourceThreadId, source);
+        assert.deepStrictEqual(staged.captured, { boundary: "first" });
+        assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+      }),
+  );
+
+  it.effect("concurrent retries capture and copy once at the direct facade", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const source = asThreadId("fork-concurrent-retry-source");
+      yield* directory.upsert(sourceBinding({ threadId: source }));
+      const calls = conversationFork.codex.forkThread.mock.calls.length;
+      let captures = 0;
+      const input = {
+        sourceThreadId: source,
+        destinationThreadId: asThreadId("fork-concurrent-retry-child"),
+        commandId: FORK_COMMAND,
+        capture: Effect.sync(() => ({ boundary: ++captures })),
+      };
+      const results = yield* Effect.all(
+        [provider.forkConversation(input), provider.forkConversation(input)],
+        { concurrency: "unbounded" },
+      );
+      assert.deepStrictEqual(results, [
+        { created: true, captured: { boundary: 1 } },
+        { created: false, captured: { boundary: 1 } },
+      ]);
+      assert.equal(captures, 1);
+      assert.equal(conversationFork.codex.forkThread.mock.calls.length, calls + 1);
+    }),
+  );
+
+  it.effect(
+    "stages an independent native copy without a routable destination and leaves the source alone",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const destination = asThreadId("fork-destination-1");
+        yield* directory.upsert(sourceBinding());
+        const before = yield* directory.getBinding(SOURCE_FORK_THREAD);
+
+        const result = yield* provider.forkConversation({
+          sourceThreadId: SOURCE_FORK_THREAD,
+          destinationThreadId: destination,
+          commandId: FORK_COMMAND,
+          capture: Effect.succeed({ boundary: "message-7" }),
+        });
+
+        assert.deepStrictEqual(result, { created: true, captured: { boundary: "message-7" } });
+        assert.equal(conversationFork.codex.forkThread.mock.calls.length, 1);
+        assert.deepStrictEqual(conversationFork.codex.forkThread.mock.calls[0]?.[0], {
+          sourceThreadId: SOURCE_FORK_THREAD,
+          destinationThreadId: destination,
+          sourceResumeCursor: { opaque: "native-source" },
+          cwd: "/tmp/fork-workspace",
+          runtimeMode: "approval-required",
+          modelSelection: { instanceId: codexInstanceId, model: "gpt-5.3-codex" },
+        });
+        assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+        const staged = Option.getOrThrow(yield* directory.forks!.get(destination));
+        assert.equal(staged.publishedSequence, null);
+        const bound = staged.binding;
+        assert.deepStrictEqual(bound.resumeCursor, { opaque: "fork-of-fork-source-1" });
+        assert.notDeepEqual(bound.resumeCursor, { opaque: "native-source" });
+        assert.deepStrictEqual(bound.runtimePayload, {
+          cwd: "/tmp/fork-workspace",
+          modelSelection: { instanceId: codexInstanceId, model: "gpt-5.3-codex" },
+          forkedFrom: {
+            threadId: SOURCE_FORK_THREAD,
+            commandId: FORK_COMMAND,
+            captured: { boundary: "message-7" },
+          },
+        });
+        assert.deepStrictEqual(yield* directory.getBinding(SOURCE_FORK_THREAD), before);
+        // Forking never opens a provider session or sends a turn.
+        assert.equal(conversationFork.codex.startSession.mock.calls.length, 0);
+        assert.equal(conversationFork.codex.sendTurn.mock.calls.length, 0);
+      }),
+  );
+
+  it.effect("returns the existing fork when the same request is retried", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const destination = asThreadId("fork-destination-retry");
+      yield* directory.upsert(sourceBinding());
+      const calls = conversationFork.codex.forkThread.mock.calls.length;
+      let captures = 0;
+      const input = {
+        sourceThreadId: SOURCE_FORK_THREAD,
+        destinationThreadId: destination,
+        commandId: FORK_COMMAND,
+        capture: Effect.sync(() => ({ boundary: `message-${++captures}` })),
+      };
+
+      assert.deepStrictEqual(yield* provider.forkConversation(input), {
+        created: true,
+        captured: { boundary: "message-1" },
+      });
+      const first = yield* directory.forks!.get(destination);
+      // A retry gets what the first request captured and captures nothing new.
+      assert.deepStrictEqual(yield* provider.forkConversation(input), {
+        created: false,
+        captured: { boundary: "message-1" },
+      });
+      assert.equal(captures, 1);
+
+      assert.equal(conversationFork.codex.forkThread.mock.calls.length, calls + 1);
+      assert.deepStrictEqual(yield* directory.forks!.get(destination), first);
+      assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+    }),
+  );
+
+  it.effect("refuses a destination that belongs to another thread or request", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* directory.upsert(sourceBinding());
+      const calls = conversationFork.codex.forkThread.mock.calls.length;
+      const occupied = asThreadId("fork-occupied");
+      yield* directory.upsert(
+        sourceBinding({ threadId: occupied, resumeCursor: { opaque: "someone-else" } }),
+      );
+      const forkedElsewhere = asThreadId("fork-of-another");
+      yield* provider.forkConversation({
+        sourceThreadId: SOURCE_FORK_THREAD,
+        destinationThreadId: forkedElsewhere,
+        commandId: CommandId.make("fork-command-other"),
+        capture: Effect.succeed(null),
+      });
+      const forkCallsAfterSetup = conversationFork.codex.forkThread.mock.calls.length;
+
+      for (const destinationThreadId of [occupied, forkedElsewhere, SOURCE_FORK_THREAD]) {
+        const error = yield* provider
+          .forkConversation({
+            sourceThreadId: SOURCE_FORK_THREAD,
+            destinationThreadId,
+            commandId: FORK_COMMAND,
+            capture: Effect.succeed(null),
+          })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderValidationError");
+      }
+
+      assert.equal(forkCallsAfterSetup, calls + 1);
+      assert.equal(conversationFork.codex.forkThread.mock.calls.length, forkCallsAfterSetup);
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* directory.getBinding(occupied)).resumeCursor,
+        { opaque: "someone-else" },
+      );
+    }),
+  );
+
+  it.effect("rejects providers without native forks before binding anything", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const source = asThreadId("fork-cursor-source");
+      const destination = asThreadId("fork-cursor-destination");
+      yield* directory.upsert(
+        sourceBinding({
+          threadId: source,
+          provider: CURSOR_DRIVER,
+          providerInstanceId: ProviderInstanceId.make("cursor"),
+        }),
+      );
+
+      const error = yield* provider
+        .forkConversation({
+          sourceThreadId: source,
+          destinationThreadId: destination,
+          commandId: FORK_COMMAND,
+          capture: Effect.succeed(null),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderValidationError");
+      assert.match(error.message, /does not support conversation forks/);
+      assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+    }),
+  );
+
+  it.effect("rejects a source that is running, unbound or has no native session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const calls = conversationFork.codex.forkThread.mock.calls.length;
+      const running = asThreadId("fork-running-source");
+      yield* directory.upsert(sourceBinding({ threadId: running, status: "running" }));
+      const fresh = asThreadId("fork-fresh-source");
+      yield* directory.upsert(sourceBinding({ threadId: fresh, resumeCursor: null }));
+
+      for (const source of [running, fresh, asThreadId("fork-unbound-source")]) {
+        const destination = asThreadId(`${source}-destination`);
+        const error = yield* provider
+          .forkConversation({
+            sourceThreadId: source,
+            destinationThreadId: destination,
+            commandId: FORK_COMMAND,
+            capture: Effect.succeed(null),
+          })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderValidationError");
+        assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+      }
+      assert.equal(conversationFork.codex.forkThread.mock.calls.length, calls);
+    }),
+  );
+
+  it.effect("rejects an adapter that hands back the source's native session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const destination = asThreadId("fork-shared-native");
+      yield* directory.upsert(sourceBinding());
+      conversationFork.codex.forkThread.mockImplementationOnce(() =>
+        Effect.succeed({ resumeCursor: { opaque: "native-source" } }),
+      );
+
+      const error = yield* provider
+        .forkConversation({
+          sourceThreadId: SOURCE_FORK_THREAD,
+          destinationThreadId: destination,
+          commandId: FORK_COMMAND,
+          capture: Effect.succeed(null),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderValidationError");
+      assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+    }),
+  );
+
+  it.effect(
+    "keeps the staged native copy after restart without exposing it to an ordinary session",
+    () =>
+      Effect.gen(function* () {
+        const codex = makeFakeCodexAdapter();
+        const persistence = yield* Layer.build(
+          ProviderSessionDirectoryLive.pipe(
+            Layer.provide(
+              ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory)),
+            ),
+          ),
+        );
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+          Effect.provide(persistence),
+        );
+        const startService = Effect.gen(function* () {
+          const scope = yield* Scope.make();
+          const services = yield* Layer.build(
+            makeProviderServiceLive().pipe(
+              Layer.provide(NodeServices.layer),
+              Layer.provide(
+                Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory),
+              ),
+              Layer.provide(
+                Layer.succeed(
+                  ProviderAdapterRegistry.ProviderAdapterRegistry,
+                  makeStaticInstanceRegistry([[codexInstanceId, codex.adapter]]),
+                ),
+              ),
+              Layer.provide(defaultServerSettingsLayer),
+              Layer.provide(serverConfigTestLayer),
+              Layer.provide(AnalyticsService.layerTest),
+              Layer.provide(
+                Layer.succeed(
+                  ProviderEventLoggers.ProviderEventLoggers,
+                  ProviderEventLoggers.NoOpProviderEventLoggers,
+                ),
+              ),
+            ),
+          ).pipe(Scope.provide(scope));
+          const service = yield* ProviderService.ProviderService.pipe(Effect.provide(services));
+          return { service, scope };
+        });
+        const source = asThreadId("restart-fork-source");
+        const destination = asThreadId("restart-fork-destination");
+        yield* directory.upsert(sourceBinding({ threadId: source }));
+        const input = {
+          sourceThreadId: source,
+          destinationThreadId: destination,
+          commandId: FORK_COMMAND,
+          capture: Effect.succeed(null),
+        };
+
+        const first = yield* startService;
+        assert.deepStrictEqual(yield* first.service.forkConversation(input), {
+          created: true,
+          captured: null,
+        });
+        const persisted = yield* directory.forks!.get(destination);
+        yield* Scope.close(first.scope, Exit.void);
+
+        const second = yield* startService;
+        assert.deepStrictEqual(yield* second.service.forkConversation(input), {
+          created: false,
+          captured: null,
+        });
+        assert.equal(codex.forkThread.mock.calls.length, 1);
+        assert.deepStrictEqual(yield* directory.forks!.get(destination), persisted);
+        assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
+        // Until atomic publication, ordinary sessions cannot resume the staged copy.
+        const session = yield* second.service.startSession(destination, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId: destination,
+          cwd: fixtureCwd("restart-fork"),
+          runtimeMode: "full-access",
+        });
+        assert.notDeepEqual(
+          session.resumeCursor,
+          Option.getOrThrow(persisted).binding.resumeCursor,
+        );
+        assert.deepStrictEqual(yield* directory.forks!.get(destination), persisted);
+        yield* Scope.close(second.scope, Exit.void);
+      }),
+  );
+
+  it.effect("keeps turns off the source from the capture until the native copy is bound", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const source = asThreadId("fork-admission-source");
+      const destination = asThreadId("fork-admission-destination");
+      yield* provider.startSession(source, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: source,
+        cwd: fixtureCwd("fork-admission"),
+        runtimeMode: "full-access",
+      });
+      yield* directory.upsert({ threadId: source, provider: CODEX_DRIVER, status: "stopped" });
+      const sendsBefore = conversationFork.codex.sendTurn.mock.calls.length;
+      const nativeBefore = conversationFork.codex.forkThread.mock.calls.length;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const order: Array<string> = [];
+      conversationFork.codex.forkThread.mockImplementationOnce((input) =>
+        Effect.sync(() => {
+          order.push("native-fork");
+          return { resumeCursor: { opaque: `copy-of-${String(input.sourceThreadId)}` } };
+        }),
+      );
+
+      const forking = yield* provider
+        .forkConversation({
+          sourceThreadId: source,
+          destinationThreadId: destination,
+          commandId: FORK_COMMAND,
+          capture: Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            order.push("captured");
+            return null;
+          }),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const sending = yield* provider
+        .sendTurn({ threadId: source, input: "arrives mid-fork" })
+        .pipe(Effect.forkChild);
+      // Nothing on this path waits on a clock: an unguarded send reaches the adapter within a few turns of the scheduler.
+      for (let turn = 0; turn < 50; turn += 1) yield* Effect.yieldNow;
+      assert.equal(conversationFork.codex.sendTurn.mock.calls.length, sendsBefore);
+
+      yield* Deferred.succeed(release, undefined);
+      assert.deepStrictEqual(yield* Fiber.join(forking), { created: true, captured: null });
+      yield* Fiber.join(sending);
+
+      assert.equal(conversationFork.codex.sendTurn.mock.calls.length, sendsBefore + 1);
+      assert.equal(conversationFork.codex.forkThread.mock.calls.length, nativeBefore + 1);
+      // The copy was taken from the source as captured, before the late turn ran.
+      assert.deepStrictEqual(order, ["captured", "native-fork"]);
+      assert.deepStrictEqual(
+        conversationFork.codex.forkThread.mock.calls.at(-1)?.[0].sourceResumeCursor,
+        { opaque: "resume-fork-admission-source" },
+      );
+    }),
+  );
+
+  it.effect("does not wait on turns for other threads, and later turns are not blocked", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const other = asThreadId("fork-admission-other");
+      const source = asThreadId("fork-admission-free-source");
+      yield* provider.startSession(other, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: other,
+        runtimeMode: "full-access",
+      });
+      yield* directory.upsert(sourceBinding({ threadId: source }));
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const forking = yield* provider
+        .forkConversation({
+          sourceThreadId: source,
+          destinationThreadId: asThreadId("fork-admission-free-destination"),
+          commandId: FORK_COMMAND,
+          capture: Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(null),
+          ),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+
+      // Another thread is unaffected while this source is held.
+      yield* provider.sendTurn({ threadId: other, input: "unrelated" });
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(forking);
+      // The source takes turns again once the fork is bound.
+      yield* provider.startSession(source, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: source,
+        cwd: fixtureCwd("fork-admission-free"),
+        runtimeMode: "full-access",
+      });
+      yield* provider.sendTurn({ threadId: source, input: "after the fork" });
+    }),
+  );
+
+  it.effect("drops a copy of a source that changed on its own while it was being forked", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const source = asThreadId("fork-moved-source");
+      const destination = asThreadId("fork-moved-destination");
+      yield* directory.upsert(sourceBinding({ threadId: source }));
+      // A turn the provider started by itself, outside this service, lands mid-copy.
+      conversationFork.codex.forkThread.mockImplementationOnce(() =>
+        directory
+          .upsert({
+            threadId: source,
+            provider: CODEX_DRIVER,
+            resumeCursor: { opaque: "moved-on" },
+          })
+          .pipe(Effect.orDie, Effect.as({ resumeCursor: { opaque: "stale-copy" } })),
+      );
+
+      const error = yield* provider
+        .forkConversation({
+          sourceThreadId: source,
+          destinationThreadId: destination,
+          commandId: FORK_COMMAND,
+          capture: Effect.succeed(null),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderValidationError");
+      assert.match(error.message, /changed while it was being forked/);
+      assert.equal(Option.isNone(yield* directory.getBinding(destination)), true);
     }),
   );
 });

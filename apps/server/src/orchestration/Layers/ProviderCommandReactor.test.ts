@@ -397,6 +397,9 @@ describe("ProviderCommandReactor", () => {
         });
       },
       rollbackConversation: () => unsupported(),
+      forkConversation: () => unsupported(),
+      readConversation: () => unsupported(),
+      transferConversation: () => unsupported(),
       uploadFeedback: () => unsupported(),
       get streamEvents() {
         return Stream.fromPubSub(runtimeEventPubSub);

@@ -61,6 +61,9 @@ export function mergeEnvironmentThread(
     unsettledAt: shell.unsettledAt,
     activeOrderKey: shell.activeOrderKey,
     autoSettleDisabledAt: shell.autoSettleDisabledAt,
+    ...(shell.automaticRecovery === undefined
+      ? {}
+      : { automaticRecovery: shell.automaticRecovery }),
     snoozedUntil: shell.snoozedUntil,
     snoozedAt: shell.snoozedAt,
     pinnedAt: shell.pinnedAt,

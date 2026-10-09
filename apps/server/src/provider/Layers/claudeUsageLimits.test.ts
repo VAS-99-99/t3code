@@ -1,3 +1,4 @@
+import type { SDKRateLimitInfo } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it } from "vite-plus/test";
 
 import { claudeRateLimitEventToUpdate, claudeUsageResponseToLimits } from "./claudeUsageLimits.ts";
@@ -174,7 +175,79 @@ describe("claudeRateLimitEventToUpdate", () => {
       ),
     ).toBeUndefined();
     expect(
-      claudeRateLimitEventToUpdate({ status: "rejected", rateLimitType: "five_hour" }, noNames),
+      claudeRateLimitEventToUpdate({ status: "allowed", rateLimitType: "five_hour" }, noNames),
     ).toBeUndefined();
+    // A refusal is data even without a fraction: the window is full.
+    expect(
+      claudeRateLimitEventToUpdate({ status: "rejected", rateLimitType: "five_hour" }, noNames),
+    ).toEqual({
+      windows: [
+        {
+          id: "five_hour",
+          kind: "session",
+          label: "Session",
+          windowDurationMins: 300,
+          usedPercent: 100,
+        },
+      ],
+      blocked: true,
+    });
+  });
+});
+
+describe("claudeRateLimitEventToUpdate blocked evidence", () => {
+  const resetsAt = 1_784_000_000;
+  const resetIso = "2026-07-14T03:33:20.000Z";
+
+  it("marks a rejected window as blocking and keeps its reset", () => {
+    expect(
+      claudeRateLimitEventToUpdate(
+        { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt },
+        noNames,
+      ),
+    ).toEqual({
+      windows: [
+        {
+          id: "five_hour",
+          kind: "session",
+          label: "Session",
+          windowDurationMins: 300,
+          usedPercent: 100,
+          resetsAt: resetIso,
+        },
+      ],
+      blocked: true,
+    });
+  });
+
+  it("reads a rejection that carries no utilization as a full window", () => {
+    const update = claudeRateLimitEventToUpdate(
+      { status: "rejected", rateLimitType: "seven_day", resetsAt, overageStatus: "rejected" },
+      noNames,
+    );
+    expect(update?.blocked).toBe(true);
+    expect(update?.windows[0]).toMatchObject({ id: "seven_day", usedPercent: 100 });
+  });
+
+  it("does not block while paid overage keeps the turn running", () => {
+    for (const overage of [
+      { overageStatus: "allowed" as const },
+      { overageStatus: "allowed_warning" as const },
+      { isUsingOverage: true as const },
+    ] satisfies ReadonlyArray<Partial<SDKRateLimitInfo>>) {
+      const update = claudeRateLimitEventToUpdate(
+        { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt, ...overage },
+        noNames,
+      );
+      expect(update?.blocked, JSON.stringify(overage)).toBeUndefined();
+    }
+  });
+
+  it("never blocks on a warning", () => {
+    const update = claudeRateLimitEventToUpdate(
+      { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.9, resetsAt },
+      noNames,
+    );
+    expect(update?.blocked).toBeUndefined();
   });
 });

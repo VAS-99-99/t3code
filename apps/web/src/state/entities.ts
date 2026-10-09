@@ -183,6 +183,27 @@ export function readThreadShell(ref: ScopedThreadRef): EnvironmentThreadShell | 
   return appAtomRegistry.get(environmentThreadShells.threadShellAtom(ref));
 }
 
+/** Resolves when the thread's shell reaches the live client store; rejects on timeout. */
+export function waitForThreadShell(ref: ScopedThreadRef, timeoutMs = 5_000): Promise<void> {
+  if (readThreadShell(ref) !== null) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let unsubscribe: (() => void) | null = null;
+    const finish = (shell: EnvironmentThreadShell | null) => {
+      if (shell === null) return;
+      clearTimeout(timeout);
+      unsubscribe?.();
+      resolve();
+    };
+    const timeout = setTimeout(() => {
+      unsubscribe?.();
+      reject(new Error("The thread did not appear in the desktop app."));
+    }, timeoutMs);
+    unsubscribe = appAtomRegistry.subscribe(environmentThreadShells.threadShellAtom(ref), finish);
+    finish(readThreadShell(ref));
+  });
+}
+
 /** The thread as `useThread` returns it, read outside React. */
 export function readThread(ref: ScopedThreadRef): EnvironmentThread | null {
   return mergeEnvironmentThread(
@@ -208,6 +229,11 @@ export function readEnvironmentSupportsSnooze(environmentId: EnvironmentId): boo
     appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
       .threadSnooze === true
   );
+}
+
+/** Provider snapshots the environment's server reports; empty before its config arrives. */
+export function readEnvironmentProviders(environmentId: EnvironmentId) {
+  return appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.providers ?? [];
 }
 
 /** Whether the environment's server understands thread.pin/unpin.
@@ -243,6 +269,14 @@ export function readEnvironmentSupportsAutoSettleOptOut(environmentId: Environme
   return (
     appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
       .threadAutoSettleOptOut === true
+  );
+}
+
+/** Whether the environment's server understands thread.recovery.set. */
+export function readEnvironmentSupportsThreadRecovery(environmentId: EnvironmentId): boolean {
+  return (
+    appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
+      .threadRecovery === true
   );
 }
 

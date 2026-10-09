@@ -28,6 +28,7 @@ import { releaseComposerDraftUploads } from "../lib/composerDraftUploads";
 import { readLocalApi } from "../localApi";
 import {
   readEnvironmentSupportsAutoSettleOptOut,
+  readEnvironmentSupportsThreadRecovery,
   readEnvironmentSupportsPinning,
   readEnvironmentSupportsPinReorder,
   readEnvironmentSupportsActiveReorder,
@@ -117,6 +118,18 @@ export class ThreadAutoSettleOptOutUnsupportedError extends Schema.TaggedError<T
 ) {
   override get message(): string {
     return "This environment's server does not support turning auto-settle off per thread yet. Update the server to use it.";
+  }
+}
+
+export class ThreadRecoveryUnsupportedError extends Schema.TaggedError<ThreadRecoveryUnsupportedError>()(
+  "ThreadRecoveryUnsupportedError",
+  {
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+  },
+) {
+  override get message(): string {
+    return "This environment's server does not support automatic recovery yet. Update the server to use it.";
   }
 }
 
@@ -215,6 +228,9 @@ export function useThreadActions() {
     reportFailure: false,
   });
   const setThreadAutoSettleMutation = useAtomCommand(threadEnvironment.setAutoSettle, {
+    reportFailure: false,
+  });
+  const setThreadRecoveryMutation = useAtomCommand(threadEnvironment.setRecovery, {
     reportFailure: false,
   });
   const reorderPinnedThreadMutation = useAtomCommand(threadEnvironment.reorderPin, {
@@ -600,6 +616,27 @@ export function useThreadActions() {
     [setThreadAutoSettleMutation],
   );
 
+  /** Turns automatic provider recovery on or off for one thread. */
+  const setThreadRecovery = useCallback(
+    async (target: ScopedThreadRef, enabled: boolean) => {
+      if (!readEnvironmentSupportsThreadRecovery(target.environmentId)) {
+        return AsyncResult.failure(
+          Cause.fail(
+            new ThreadRecoveryUnsupportedError({
+              environmentId: target.environmentId,
+              threadId: target.threadId,
+            }),
+          ),
+        );
+      }
+      return setThreadRecoveryMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId, enabled },
+      });
+    },
+    [setThreadRecoveryMutation],
+  );
+
   const pinThread = useCallback(
     async (target: ScopedThreadRef, opts: { orderKey?: string } = {}) => {
       // Version skew: never send the command to a server that predates it.
@@ -920,6 +957,7 @@ export function useThreadActions() {
       reorderPinnedThread,
       reorderActiveThread,
       setThreadAutoSettle,
+      setThreadRecovery,
     }),
     [
       archiveThread,
@@ -930,6 +968,7 @@ export function useThreadActions() {
       reorderPinnedThread,
       reorderActiveThread,
       setThreadAutoSettle,
+      setThreadRecovery,
       settleThread,
       snoozeThread,
       unarchiveThread,

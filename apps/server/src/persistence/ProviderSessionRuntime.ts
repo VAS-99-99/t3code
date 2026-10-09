@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
+import * as ProviderConversationForks from "./ProviderConversationForks.ts";
 
 import {
   AgentSessionImportSource,
@@ -75,6 +76,7 @@ export interface ProviderSessionRuntimeUpsertOptions {
 export class ProviderSessionRuntimeRepository extends Context.Service<
   ProviderSessionRuntimeRepository,
   {
+    readonly forks: ProviderConversationForks.ProviderConversationForkStore;
     /**
      * Insert or replace a provider runtime row.
      *
@@ -172,6 +174,7 @@ function toPersistenceSqlOrDecodeError(
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const forks = yield* ProviderConversationForks.make;
 
   // Runtime writes can carry stale payloads. Only recordImportedTranscript may
   // change source records, so restore that field from the row being updated.
@@ -468,6 +471,7 @@ export const make = Effect.gen(function* () {
     );
 
   return {
+    forks,
     upsert,
     recordImportedTranscript,
     getByThreadId,

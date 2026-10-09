@@ -30,6 +30,7 @@ import {
   orchestrationCommandDuration,
 } from "../../observability/Metrics.ts";
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
+import * as ProviderConversationForks from "../../persistence/ProviderConversationForks.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
@@ -83,6 +84,7 @@ function commandToAggregateRef(command: OrchestrationCommand): {
 
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const forks = yield* ProviderConversationForks.make;
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
@@ -302,6 +304,28 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 status: "accepted",
                 error: null,
               });
+
+              if (envelope.command.type === "thread.create-with-history" && envelope.command.fork) {
+                const fork = envelope.command.fork;
+                const command = envelope.command;
+                const staged = Option.getOrUndefined(yield* forks.get(command.threadId));
+                if (
+                  staged?.sourceThreadId !== fork.sourceThreadId ||
+                  staged.commandId !== fork.commandId ||
+                  command.commandId !== `${staged.commandId}:create` ||
+                  !(yield* forks.publish(
+                    command.threadId,
+                    lastSavedEvent.sequence,
+                    command.createdAt,
+                  ))
+                ) {
+                  return yield* new OrchestrationCommandInvariantError({
+                    commandType: command.type,
+                    detail:
+                      "The destination does not belong to this staged fork or already has a provider binding.",
+                  });
+                }
+              }
 
               return {
                 committedEvents,

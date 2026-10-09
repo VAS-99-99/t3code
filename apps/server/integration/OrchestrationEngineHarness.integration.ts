@@ -69,6 +69,7 @@ import { ThreadDeletionReactor } from "../src/orchestration/Services/ThreadDelet
 import * as ThreadSettlementReactor from "../src/orchestration/ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "../src/orchestration/PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../src/orchestration/ThreadPullRequestReactor.ts";
+import * as ProviderRecoveryReactor from "../src/orchestration/ProviderRecoveryReactor.ts";
 import { OrchestrationReactor } from "../src/orchestration/Services/OrchestrationReactor.ts";
 import { ProjectionSnapshotQuery } from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
@@ -396,6 +397,13 @@ export const makeOrchestrationIntegrationHarness = (
         Layer.succeed(ThreadDeletionReactor, {
           start: () => Effect.void,
           drainThrough: () => Effect.void,
+        }),
+      ),
+      // Recovery has its own journey tests; this harness only needs the engine reactors.
+      Layer.provideMerge(
+        Layer.succeed(ProviderRecoveryReactor.ProviderRecoveryReactor, {
+          start: () => Effect.void,
+          drain: Effect.void,
         }),
       ),
       Layer.provideMerge(

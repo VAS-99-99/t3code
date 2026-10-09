@@ -17,6 +17,7 @@ import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
   buildTurnStartParams,
   describeMcpElicitation,
+  forkCodexThread,
   hasConfiguredMcpServer,
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
@@ -1066,6 +1067,101 @@ describe("openCodexThread", () => {
 
       NodeAssert.ok(isCodexAppServerRequestError(error));
       NodeAssert.equal(error.errorMessage, "timed out waiting for server");
+    }),
+  );
+});
+
+describe("forkCodexThread", () => {
+  const forkInput = (client: Parameters<typeof forkCodexThread>[0]["client"]) => ({
+    client,
+    threadId: ThreadId.make("thread-fork"),
+    sourceThreadId: "native-source",
+    runtimeMode: "auto" as const,
+    cwd: "/tmp/project",
+    requestedModel: "gpt-5.3-codex",
+    serviceTier: undefined,
+  });
+
+  it.effect("forks the native thread by id into a persisted thread without loading turns", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ method: string; payload: unknown }> = [];
+      const response = makeThreadOpenResponse("native-fork");
+      const forked = yield* forkCodexThread(
+        forkInput({
+          raw: {
+            request: (method, payload) => {
+              calls.push({ method, payload });
+              return Effect.succeed(response);
+            },
+          },
+        }),
+      );
+
+      NodeAssert.equal(forked.thread.id, "native-fork");
+      NodeAssert.deepStrictEqual(calls, [
+        {
+          method: "thread/fork",
+          payload: {
+            threadId: "native-source",
+            cwd: "/tmp/project",
+            model: "gpt-5.3-codex",
+            approvalPolicy: "on-request",
+            sandbox: "workspace-write",
+            approvalsReviewer: "auto_review",
+            ephemeral: false,
+            excludeTurns: true,
+          },
+        },
+      ]);
+    }),
+  );
+
+  for (const unsupported of [
+    CodexErrors.CodexAppServerRequestError.methodNotFound("thread/fork"),
+    new CodexErrors.CodexAppServerRequestError({
+      code: -32600,
+      errorMessage:
+        "Invalid request: unknown variant `thread/fork`, expected one of `initialize`, `thread/start`",
+    }),
+  ]) {
+    it.effect(`explains that an older Codex has no native thread fork (${unsupported.code})`, () =>
+      Effect.gen(function* () {
+        const error = yield* forkCodexThread(
+          forkInput({ raw: { request: () => Effect.fail(unsupported) } }),
+        ).pipe(Effect.flip);
+
+        NodeAssert.ok(isCodexAppServerRequestError(error));
+        NodeAssert.equal(error.code, unsupported.code);
+        NodeAssert.match(error.errorMessage, /does not support forking threads.*Update Codex/);
+      }),
+    );
+  }
+
+  it.effect("passes other fork failures through untouched", () =>
+    Effect.gen(function* () {
+      const missing = new CodexErrors.CodexAppServerRequestError({
+        code: -32600,
+        errorMessage: "no rollout found for thread id native-source",
+      });
+      const error = yield* forkCodexThread(
+        forkInput({ raw: { request: () => Effect.fail(missing) } }),
+      ).pipe(Effect.flip);
+
+      NodeAssert.equal(error, missing);
+    }),
+  );
+
+  it.effect("rejects a fork response that does not identify the new thread", () =>
+    Effect.gen(function* () {
+      const error = yield* forkCodexThread(
+        forkInput({
+          raw: { request: () => Effect.succeed({ ...makeThreadOpenResponse("x"), thread: {} }) },
+        }),
+      ).pipe(Effect.flip);
+
+      NodeAssert.ok(isCodexAppServerRequestError(error));
+      NodeAssert.equal(error.method, "thread/fork");
+      NodeAssert.equal(error.operation, "decode-payload");
     }),
   );
 });

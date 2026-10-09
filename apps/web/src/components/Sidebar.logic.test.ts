@@ -33,6 +33,7 @@ import {
   shouldClearThreadSelectionOnMouseDown,
   shouldRecedeSidebarThread,
   sortLogicalProjectsForSidebar,
+  groupInboxThreadsByProject,
   sortInboxThreadsByReturn,
   resolveSidebarDropTarget,
   pinOrderKeyBetween,
@@ -2556,6 +2557,95 @@ describe("Working shelf (beta)", () => {
           entry === waiting ? Date.parse("2026-03-09T11:05:00.000Z") : undefined,
         ).map((entry) => entry.id),
       ).toEqual(["asks-approval", "finished"]);
+    });
+  });
+
+  describe("groupInboxThreadsByProject", () => {
+    const remoteEnvironmentId = EnvironmentId.make("environment-remote");
+    const thread = (
+      id: string,
+      projectId: string,
+      createdAt: string,
+      environmentId = localEnvironmentId,
+    ) => ({
+      id: ThreadId.make(id),
+      environmentId,
+      projectId: ProjectId.make(projectId),
+      createdAt,
+      unsettledAt: null,
+      latestTurn: null,
+    });
+    const ids = (groups: readonly { key: string; threads: readonly { id: string }[] }[]) =>
+      groups.map((group) => [group.key, group.threads.map((entry) => entry.id)]);
+
+    const a1 = thread("a1", "alpha", "2026-03-09T12:00:00.000Z");
+    const b1 = thread("b1", "beta", "2026-03-09T11:00:00.000Z");
+    const a2 = thread("a2", "alpha", "2026-03-09T10:00:00.000Z");
+    const c1 = thread("c1", "gamma", "2026-03-09T09:00:00.000Z");
+
+    it("groups mixed projects, ordering groups by their newest row and keeping row order", () => {
+      const sorted = sortInboxThreadsByReturn([c1, a2, b1, a1]);
+      expect(ids(groupInboxThreadsByProject(sorted))).toEqual([
+        ["environment-local:alpha", ["a1", "a2"]],
+        ["environment-local:beta", ["b1"]],
+        ["environment-local:gamma", ["c1"]],
+      ]);
+    });
+
+    it("keeps same-named project ids in different environments apart", () => {
+      const remoteAlpha = thread("r1", "alpha", "2026-03-09T11:30:00.000Z", remoteEnvironmentId);
+      const groups = groupInboxThreadsByProject(sortInboxThreadsByReturn([a1, remoteAlpha, a2]));
+      expect(ids(groups)).toEqual([
+        ["environment-local:alpha", ["a1", "a2"]],
+        ["environment-remote:alpha", ["r1"]],
+      ]);
+      expect(groups[1]).toMatchObject({
+        environmentId: remoteEnvironmentId,
+        projectId: ProjectId.make("alpha"),
+      });
+    });
+
+    it("recounts after a thread settles and again after it is un-settled", () => {
+      const counts = (inbox: readonly (typeof a1)[]) =>
+        groupInboxThreadsByProject(sortInboxThreadsByReturn(inbox)).map(
+          (group) => group.threads.length,
+        );
+      expect(counts([a1, a2, b1])).toEqual([2, 1]);
+      // a2 settles: it leaves the inbox list, so the alpha count drops.
+      expect(counts([a1, b1])).toEqual([1, 1]);
+      // b1 settles: its group disappears instead of rendering empty.
+      expect(counts([a1])).toEqual([1]);
+      // un-settled a2 returns on top of its project, newest return first.
+      const reopened = { ...a2, unsettledAt: "2026-03-09T13:00:00.000Z" };
+      expect(ids(groupInboxThreadsByProject(sortInboxThreadsByReturn([a1, reopened, b1])))).toEqual(
+        [
+          ["environment-local:alpha", ["a2", "a1"]],
+          ["environment-local:beta", ["b1"]],
+        ],
+      );
+    });
+
+    it("follows the existing filter and sort instead of re-sorting", () => {
+      // A project scope filter is applied before grouping.
+      const scoped = [a1, b1, a2, c1].filter((entry) => entry.projectId === "alpha");
+      expect(ids(groupInboxThreadsByProject(scoped))).toEqual([
+        ["environment-local:alpha", ["a1", "a2"]],
+      ]);
+      // Caller order wins: a stale-first list keeps the oldest project first.
+      expect(ids(groupInboxThreadsByProject([c1, a2, b1])).map(([key]) => key)).toEqual([
+        "environment-local:gamma",
+        "environment-local:alpha",
+        "environment-local:beta",
+      ]);
+    });
+
+    it("flattens back to the ungrouped list's rows, none lost or duplicated", () => {
+      const flat = sortInboxThreadsByReturn([c1, a2, b1, a1]);
+      const regrouped = groupInboxThreadsByProject(flat).flatMap((group) => group.threads);
+      expect(regrouped.map((entry) => entry.id).toSorted()).toEqual(
+        flat.map((entry) => entry.id).toSorted(),
+      );
+      expect(groupInboxThreadsByProject([])).toEqual([]);
     });
   });
 

@@ -1594,6 +1594,38 @@ it.effect("rejects thread history imports without messages", () =>
   }),
 );
 
+const threadWithHistory = {
+  type: "thread.create-with-history",
+  commandId: "command-with-history",
+  threadId: "thread-1",
+  projectId: "project-1",
+  title: "Fork",
+  modelSelection: { instanceId: "codex", model: "gpt-5" },
+  runtimeMode: "full-access",
+  branch: null,
+  worktreePath: null,
+  createdAt: "2026-01-01T00:00:00.000Z",
+  messages: [
+    { messageId: "message-1", role: "user", text: "Hi", createdAt: "2026-01-01T00:00:00.000Z" },
+  ],
+};
+
+it.effect("creates a thread with history only through the server, and needs history", () =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeOrchestrationCommand(threadWithHistory);
+    assert.strictEqual(decoded.type, "thread.create-with-history");
+    // Clients cannot dispatch it, so they cannot mint threads with imported history.
+    assert.strictEqual(
+      (yield* Effect.exit(decodeClientOrchestrationCommand(threadWithHistory)))._tag,
+      "Failure",
+    );
+    assert.strictEqual(
+      (yield* Effect.exit(decodeOrchestrationCommand({ ...threadWithHistory, messages: [] })))._tag,
+      "Failure",
+    );
+  }),
+);
+
 it("isProviderSendTurnSupportedImageMimeType accepts raster formats and rejects svg", () => {
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/png"), true);
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("IMAGE/JPEG"), true);
@@ -1687,4 +1719,93 @@ it.effect("encodes compatible icons inside snapshots and client commands", () =>
     if (command.type !== "project.meta.update") throw new Error("Unexpected command");
     assert.deepEqual(yield* decodeNightlyIcon(command.projectIcon), fallback);
   }),
+);
+
+it.effect(
+  "keeps old snapshots, events and mobile-created threads valid with automatic recovery",
+  () =>
+    Effect.gen(function* () {
+      const common = {
+        id: "thread-1",
+        projectId: "project-1",
+        title: "Thread",
+        modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        latestTurn: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        archivedAt: null,
+        session: null,
+      };
+      // An older server never sends the flag; the client reads that as "not recovering".
+      const oldShell = yield* decodeOrchestrationThreadShell({
+        ...common,
+        latestUserMessageAt: null,
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+        hasActionableProposedPlan: false,
+      });
+      assert.strictEqual(oldShell.automaticRecovery, undefined);
+      const newShell = yield* decodeOrchestrationThreadShell({
+        ...common,
+        automaticRecovery: true,
+        latestUserMessageAt: null,
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+        hasActionableProposedPlan: false,
+      });
+      assert.strictEqual(newShell.automaticRecovery, true);
+
+      // Events written before the feature carry no flag.
+      const oldCreated = yield* decodeThreadCreatedPayload({
+        threadId: "thread-1",
+        projectId: "project-1",
+        title: "Thread",
+        modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      assert.strictEqual(oldCreated.automaticRecovery, undefined);
+
+      // An older mobile app creates threads without the field and still validates.
+      const mobileCreate = yield* decodeClientOrchestrationCommand({
+        type: "thread.create",
+        commandId: "cmd-mobile-create",
+        threadId: "thread-mobile",
+        projectId: "project-1",
+        title: "From mobile",
+        modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      assert.strictEqual(mobileCreate.type, "thread.create");
+
+      const toggle = yield* decodeClientOrchestrationCommand({
+        type: "thread.recovery.set",
+        commandId: "cmd-recovery",
+        threadId: "thread-1",
+        enabled: true,
+      });
+      assert.strictEqual(toggle.type, "thread.recovery.set");
+      const event = yield* decodeOrchestrationEvent({
+        sequence: 1,
+        eventId: "event-1",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        commandId: "cmd-recovery",
+        causationEventId: null,
+        correlationId: "cmd-recovery",
+        metadata: {},
+        type: "thread.recovery-set",
+        payload: { threadId: "thread-1", enabled: false, updatedAt: "2026-01-01T00:00:00.000Z" },
+      });
+      assert.strictEqual(event.type, "thread.recovery-set");
+    }),
 );

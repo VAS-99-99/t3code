@@ -43,6 +43,7 @@ import {
   ThreadPinnedPayload,
   ThreadPinReorderedPayload,
   ThreadAutoSettleSetPayload,
+  ThreadRecoverySetPayload,
   ThreadPullRequestLinkedPayload,
   ThreadPullRequestSyncedPayload,
   ThreadPullRequestUnlinkedPayload,
@@ -456,6 +457,7 @@ export function projectEvent(
             unsettledAt: null,
             activeOrderKey: null,
             autoSettleDisabledAt: null,
+            ...(payload.automaticRecovery === true ? { automaticRecovery: true } : {}),
             snoozedUntil: null,
             snoozedAt: null,
             deletedAt: null,
@@ -602,6 +604,17 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             autoSettleDisabledAt: payload.autoSettleDisabledAt,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
+
+    case "thread.recovery-set":
+      return decodeForEvent(ThreadRecoverySetPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            automaticRecovery: payload.enabled,
             updatedAt: payload.updatedAt,
           }),
         })),

@@ -9,6 +9,7 @@ import type {
 import * as Option from "effect/Option";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import type { ProviderConversationForkStore } from "../../persistence/ProviderConversationForks.ts";
 
 import type {
   ProviderSessionDirectoryPersistenceError,
@@ -46,6 +47,8 @@ export interface ProviderSessionDirectoryUpsertOptions {
 }
 
 export interface ProviderSessionDirectoryShape {
+  /** Native fork staging is available on the persistent directory. */
+  readonly forks?: ProviderConversationForkStore;
   readonly upsert: (
     binding: ProviderRuntimeBinding,
     options?: ProviderSessionDirectoryUpsertOptions,

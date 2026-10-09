@@ -148,6 +148,7 @@ import * as NewProject from "./project/NewProject.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
+import * as ThreadFork from "./project/ThreadFork.ts";
 import { importRecentAgentThreads } from "./project/AgentSessionImporter.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -633,6 +634,7 @@ const makeWsRpcLayer = (
         | WorkspacePaths.WorkspacePaths
       >();
       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
+      const threadFork = yield* ThreadFork.ThreadFork;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
@@ -3468,6 +3470,10 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.threadsFork]: (input) =>
+          observeRpcEffect(WS_METHODS.threadsFork, threadFork.fork(input), {
+            "rpc.aggregate": "orchestration",
+          }),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,
@@ -4108,6 +4114,8 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         ),
     });
     const pullRequests = yield* PullRequestService.PullRequestService;
+    // Built once for the server, so its lock covers every connection.
+    const threadFork = yield* ThreadFork.ThreadFork;
     const sql = yield* SqlClient.SqlClient;
     return HttpRouter.add(
       "GET",
@@ -4156,6 +4164,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               // One server-lifetime service means clients share the same PR caches, and a WS
               // mutation invalidates the HTTP diff cache that every client reads from.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
+              Layer.provide(Layer.succeed(ThreadFork.ThreadFork, threadFork)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(

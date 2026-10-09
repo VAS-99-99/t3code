@@ -77,6 +77,12 @@ export type ServerProviderUsageLimits = typeof ServerProviderUsageLimits.Type;
  */
 export const ProviderUsageLimitsUpdate = Schema.Struct({
   windows: Schema.Array(ServerProviderUsageWindow),
+  /**
+   * Set by an adapter that saw the provider refuse work because a window ran
+   * out, with no paid overage covering it. `windows` then holds what the
+   * adapter knows of the exhausted allowance, possibly nothing.
+   */
+  blocked: Schema.optional(Schema.Boolean),
 });
 export type ProviderUsageLimitsUpdate = typeof ProviderUsageLimitsUpdate.Type;
 

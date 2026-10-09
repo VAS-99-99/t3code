@@ -43,6 +43,7 @@ export type PinThreadInput = CommandInput<"thread.pin">;
 export type UnpinThreadInput = CommandInput<"thread.unpin">;
 export type ReorderPinnedThreadInput = CommandInput<"thread.pin.reorder">;
 export type SetThreadAutoSettleInput = CommandInput<"thread.auto-settle.set">;
+export type SetThreadRecoveryInput = CommandInput<"thread.recovery.set">;
 export type ReorderActiveThreadInput = CommandInput<"thread.active.reorder">;
 export type UpdateThreadMetadataInput = CommandInput<"thread.meta.update">;
 export type LinkThreadPullRequestInput = CommandInput<"thread.pull-request.link">;
@@ -233,6 +234,16 @@ export const setThreadAutoSettle: (input: SetThreadAutoSettleInput) => CommandEf
   return yield* dispatch({
     ...input,
     type: "thread.auto-settle.set",
+    commandId: yield* commandId(input),
+  });
+});
+
+export const setThreadRecovery: (input: SetThreadRecoveryInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.setThreadRecovery",
+)(function* (input) {
+  return yield* dispatch({
+    ...input,
+    type: "thread.recovery.set",
     commandId: yield* commandId(input),
   });
 });

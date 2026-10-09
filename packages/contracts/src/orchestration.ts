@@ -842,6 +842,10 @@ export const OrchestrationThread = Schema.Struct({
   // Survives manual settle, un-settle, and activity: only the user clears it.
   // Optional so payloads from older servers still decode.
   autoSettleDisabledAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  // True while the server may resume this thread's turns after a provider
+  // outage or quota exhaustion. New threads opt in; older threads only by an
+  // explicit thread.recovery.set. Optional so older servers still decode.
+  automaticRecovery: Schema.optional(Schema.Boolean),
   // Pending-only state. Optional so older servers remain compatible.
   titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   titleState: Schema.optional(Schema.NullOr(ThreadTitleState)),
@@ -913,6 +917,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   pinOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   activeOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   autoSettleDisabledAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  automaticRecovery: Schema.optional(Schema.Boolean),
   titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   titleState: Schema.optional(Schema.NullOr(ThreadTitleState)),
   session: Schema.NullOr(OrchestrationSession),
@@ -1116,8 +1121,7 @@ const ProjectDeleteCommand = Schema.Struct({
   force: Schema.optional(Schema.Boolean),
 });
 
-const ThreadCreateCommand = Schema.Struct({
-  type: Schema.Literal("thread.create"),
+const threadCreateFields = {
   commandId: CommandId,
   threadId: ThreadId,
   projectId: ProjectId,
@@ -1130,7 +1134,34 @@ const ThreadCreateCommand = Schema.Struct({
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
+};
+
+const ThreadCreateCommand = Schema.Struct({
+  type: Schema.Literal("thread.create"),
+  ...threadCreateFields,
   historyImport: Schema.optional(Schema.Literal(true)),
+  // Absent: new threads opt in, imported history does not.
+  automaticRecovery: Schema.optional(Schema.Boolean),
+});
+
+const ImportedHistoryMessage = Schema.Struct({
+  messageId: MessageId,
+  role: Schema.Literals(["user", "assistant"]),
+  text: Schema.String,
+  attachments: Schema.optional(Schema.Array(ChatAttachment)),
+  context: Schema.optional(OrchestrationMessageContext),
+  createdAt: IsoDateTime,
+});
+
+/**
+ * Creates a thread that already holds imported history. One command, so one
+ * transaction: no ordinary thread is ever visible with part of its history.
+ */
+const ThreadCreateWithHistoryCommand = Schema.Struct({
+  type: Schema.Literal("thread.create-with-history"),
+  ...threadCreateFields,
+  messages: Schema.Array(ImportedHistoryMessage).check(Schema.isNonEmpty()),
+  fork: Schema.optional(Schema.Struct({ sourceThreadId: ThreadId, commandId: CommandId })),
 });
 
 const ThreadDeleteCommand = Schema.Struct({
@@ -1228,6 +1259,14 @@ const ThreadAutoSettleSetCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   // false turns automatic settlement off for this thread, true turns it back on.
+  enabled: Schema.Boolean,
+});
+
+const ThreadRecoverySetCommand = Schema.Struct({
+  type: Schema.Literal("thread.recovery.set"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  // false cancels any pending recovery and keeps this thread manual.
   enabled: Schema.Boolean,
 });
 
@@ -1440,6 +1479,7 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUnpinCommand,
   ThreadPinReorderCommand,
   ThreadAutoSettleSetCommand,
+  ThreadRecoverySetCommand,
   ThreadActiveReorderCommand,
   ThreadMetaUpdateCommand,
   ThreadPullRequestLinkCommand,
@@ -1474,6 +1514,7 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUnpinCommand,
   ThreadPinReorderCommand,
   ThreadAutoSettleSetCommand,
+  ThreadRecoverySetCommand,
   ThreadActiveReorderCommand,
   ThreadMetaUpdateCommand,
   ThreadPullRequestLinkCommand,
@@ -1541,14 +1582,7 @@ const ThreadHistoryImportCommand = Schema.Struct({
   type: Schema.Literal("thread.history.import"),
   commandId: CommandId,
   threadId: ThreadId,
-  messages: Schema.Array(
-    Schema.Struct({
-      messageId: MessageId,
-      role: Schema.Literals(["user", "assistant"]),
-      text: Schema.String,
-      createdAt: IsoDateTime,
-    }),
-  ).check(Schema.isNonEmpty()),
+  messages: Schema.Array(ImportedHistoryMessage).check(Schema.isNonEmpty()),
 });
 
 /**
@@ -1667,6 +1701,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadMessageAssistantCompleteCommand,
   ThreadMessageReasoningDeltaCommand,
   ThreadMessageReasoningCompleteCommand,
+  ThreadCreateWithHistoryCommand,
   ThreadHistoryImportCommand,
   ThreadMessageUserAppendCommand,
   ThreadProposedPlanUpsertCommand,
@@ -1703,6 +1738,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.unpinned",
   "thread.pin-reordered",
   "thread.auto-settle-set",
+  "thread.recovery-set",
   "thread.meta-updated",
   "thread.pull-request-linked",
   "thread.pull-request-unlinked",
@@ -1772,6 +1808,8 @@ export const ThreadCreatedPayload = Schema.Struct({
   ),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  // Absent on events written before automatic recovery: those threads stay manual.
+  automaticRecovery: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -1845,6 +1883,12 @@ export const ThreadAutoSettleSetPayload = Schema.Struct({
   threadId: ThreadId,
   // Null re-enables automatic settlement.
   autoSettleDisabledAt: Schema.NullOr(IsoDateTime),
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadRecoverySetPayload = Schema.Struct({
+  threadId: ThreadId,
+  enabled: Schema.Boolean,
   updatedAt: IsoDateTime,
 });
 
@@ -2116,6 +2160,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.auto-settle-set"),
     payload: ThreadAutoSettleSetPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.recovery-set"),
+    payload: ThreadRecoverySetPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

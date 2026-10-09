@@ -182,6 +182,8 @@ export interface CodexSessionRuntimeOptions {
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
+  /** Start by forking this native thread, instead of resuming or starting one. */
+  readonly forkFromThreadId?: string;
   readonly appServerArgs?: ReadonlyArray<string>;
   /** The provider's model list; supplies the display name for runtime info. */
   readonly models?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
@@ -785,6 +787,69 @@ export const openCodexThread = (input: {
       ),
     );
 };
+
+interface CodexThreadForkClient {
+  readonly raw: {
+    readonly request: (
+      method: "thread/fork",
+      payload: CodexRpc.ClientRequestParamsByMethod["thread/fork"],
+    ) => Effect.Effect<unknown, CodexErrors.CodexAppServerError>;
+  };
+}
+
+// A Codex without thread/fork answers "method not found" or, from its request
+// enum, "invalid request: unknown variant `thread/fork`" (seen on 0.162).
+const isUnknownThreadForkMethod = (error: CodexErrors.CodexAppServerRequestError) =>
+  error.code === -32601 ||
+  (error.code === -32600 && error.errorMessage.includes("unknown variant `thread/fork`"));
+
+/**
+ * Native `thread/fork`: Codex copies the thread's persisted history into a new
+ * thread with its own id and leaves the source untouched.
+ */
+export const forkCodexThread = (input: {
+  readonly client: CodexThreadForkClient;
+  readonly threadId: ThreadId;
+  readonly sourceThreadId: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly cwd: string;
+  readonly requestedModel: string | undefined;
+  readonly serviceTier: CodexServiceTier | undefined;
+}): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> =>
+  input.client.raw
+    .request("thread/fork", {
+      threadId: input.sourceThreadId,
+      ...buildThreadStartParams({
+        cwd: input.cwd,
+        runtimeMode: input.runtimeMode,
+        model: input.requestedModel,
+        serviceTier: input.serviceTier,
+      }),
+      ephemeral: false,
+      excludeTurns: true,
+    })
+    .pipe(
+      Effect.flatMap((response) =>
+        decodeCodexThreadResumeMetadata(response).pipe(
+          Effect.mapError((error) =>
+            CodexErrors.CodexAppServerRequestError.invalidPayload(
+              "thread/fork",
+              "decode-payload",
+              error,
+            ),
+          ),
+        ),
+      ),
+      Effect.mapError((error) =>
+        error._tag === "CodexAppServerRequestError" && isUnknownThreadForkMethod(error)
+          ? new CodexErrors.CodexAppServerRequestError({
+              code: error.code,
+              errorMessage:
+                "The installed Codex does not support forking threads (thread/fork). Update Codex to fork this conversation.",
+            })
+          : error,
+      ),
+    );
 
 function readNotificationThreadId(notification: CodexServerNotification): string | undefined {
   switch (notification.method) {
@@ -2485,15 +2550,26 @@ export const makeCodexSessionRuntime = (
 
       const requestedModel = normalizeCodexModelSlug(options.model);
 
-      const opened = yield* openCodexThread({
-        client,
-        threadId: options.threadId,
-        runtimeMode: options.runtimeMode,
-        cwd: options.cwd,
-        requestedModel,
-        serviceTier: options.serviceTier,
-        resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
-      });
+      const opened =
+        options.forkFromThreadId !== undefined
+          ? yield* forkCodexThread({
+              client,
+              threadId: options.threadId,
+              sourceThreadId: options.forkFromThreadId,
+              runtimeMode: options.runtimeMode,
+              cwd: options.cwd,
+              requestedModel,
+              serviceTier: options.serviceTier,
+            })
+          : yield* openCodexThread({
+              client,
+              threadId: options.threadId,
+              runtimeMode: options.runtimeMode,
+              cwd: options.cwd,
+              requestedModel,
+              serviceTier: options.serviceTier,
+              resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
+            });
 
       const providerThreadId = opened.thread.id;
       const session = {

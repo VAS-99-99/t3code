@@ -127,25 +127,46 @@ function makeWindow(
 }
 
 /**
+ * A rejected window refuses work unless paid overage is covering it. Shared by
+ * the stream mapper below and the adapter's pause notice.
+ */
+export function claudeRateLimitBlocking(info: SDKRateLimitInfo): {
+  readonly overageAllowed: boolean;
+  readonly blocked: boolean;
+} {
+  const overageAllowed =
+    info.overageStatus === "allowed" ||
+    info.overageStatus === "allowed_warning" ||
+    info.isUsingOverage === true ||
+    info.overageInUse === true;
+  return { overageAllowed, blocked: info.status === "rejected" && !overageAllowed };
+}
+
+/**
  * Utilization is a 0–1 fraction on the streamed event. An overage-included
  * event before any probe has named the bucket is dropped: guessing a name
- * would draw a row the next probe cannot reconcile.
+ * would draw a row the next probe cannot reconcile. A blocking rejection
+ * without a fraction is a full window, and says so with `blocked`.
  */
 export function claudeRateLimitEventToUpdate(
   info: SDKRateLimitInfo,
   names: ClaudeScopedLimitNames,
 ): ProviderUsageLimitsUpdate | undefined {
   const type: string | undefined = info.rateLimitType;
-  if (!type || typeof info.utilization !== "number") {
+  const { blocked } = claudeRateLimitBlocking(info);
+  const utilization =
+    typeof info.utilization === "number" ? info.utilization : blocked ? 1 : undefined;
+  if (!type || utilization === undefined) {
     return undefined;
   }
-  const usedPercent = info.utilization * 100;
+  const usedPercent = utilization * 100;
   const resetsAt = isoFromEpochSeconds(info.resetsAt);
+  const flag = blocked ? { blocked: true } : {};
   if (type in WINDOWS) {
-    return { windows: [makeWindow(type, usedPercent, resetsAt)] };
+    return { windows: [makeWindow(type, usedPercent, resetsAt)], ...flag };
   }
   if (type === OVERAGE_INCLUDED_EVENT_TYPE && names.overageIncluded) {
-    return { windows: [scopedWindow(names.overageIncluded, usedPercent, resetsAt)] };
+    return { windows: [scopedWindow(names.overageIncluded, usedPercent, resetsAt)], ...flag };
   }
   return undefined;
 }

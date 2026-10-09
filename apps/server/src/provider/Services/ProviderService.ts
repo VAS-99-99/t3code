@@ -12,6 +12,7 @@
  * @module ProviderService
  */
 import type {
+  CommandId,
   ProviderInterruptTurnInput,
   ProviderInstanceId,
   ProviderRespondToRequestInput,
@@ -32,8 +33,40 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
-import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type { ProviderAdapterCapabilities, ProviderThreadSnapshot } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
+
+export interface ProviderForkConversationInput<E = never> {
+  readonly sourceThreadId: ThreadId;
+  /** Must not have a provider binding yet, unless this same request created it. */
+  readonly destinationThreadId: ThreadId;
+  /** Identifies the request: repeating it returns the fork it already made. */
+  readonly commandId: CommandId;
+  /**
+   * The caller's record of what it is forking, as JSON. It runs only when this
+   * call creates the fork, while no turn can start on the source, and a
+   * failure aborts the fork. Its result is stored with the binding and handed
+   * back unchanged on every retry, however far the source has moved on.
+   */
+  readonly capture: Effect.Effect<unknown, E>;
+  /** Publishes staged history under destination admission, after native acceptance. */
+  readonly publish?: (fork: ProviderForkConversationResult) => Effect.Effect<void, E>;
+}
+
+export interface ProviderTransferConversationInput<E = never> {
+  readonly threadId: ThreadId;
+  readonly toInstanceId: ProviderInstanceId;
+  /** A native copy a previous attempt already accepted: bound as is, never copied again. */
+  readonly stagedCursor?: unknown;
+  /** Runs once the target accepted a new copy, before the binding moves, so a restart can bind it. */
+  readonly onForked?: (cursor: unknown) => Effect.Effect<void, E>;
+}
+
+export interface ProviderForkConversationResult {
+  /** False when a retry found the fork already bound. */
+  readonly created: boolean;
+  readonly captured: unknown;
+}
 
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
@@ -120,6 +153,33 @@ export interface ProviderServiceShape {
     readonly threadId: ThreadId;
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Fork an idle conversation and durably stage its independent native session.
+   * Atomic thread creation publishes the binding. Starts no session and no turn, and never
+   * shares the source's native session.
+   */
+  readonly forkConversation: <E>(
+    input: ProviderForkConversationInput<E>,
+  ) => Effect.Effect<ProviderForkConversationResult, ProviderServiceError | E>;
+
+  /**
+   * Read the provider's own record of a thread, resuming its bound session if
+   * none is live. Starts no turn.
+   */
+  readonly readConversation: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ProviderThreadSnapshot, ProviderServiceError>;
+
+  /**
+   * Move an idle thread to another configured account of the same driver by
+   * asking the target account's own provider configuration to copy the native
+   * history. Fails, leaving the thread where it was, when that account cannot
+   * see the conversation. Keeps the ThreadId; starts no turn.
+   */
+  readonly transferConversation: <E = never>(
+    input: ProviderTransferConversationInput<E>,
+  ) => Effect.Effect<void, ProviderServiceError | E>;
 
   /**
    * Upload a thread and return the provider's shareable feedback identifier.

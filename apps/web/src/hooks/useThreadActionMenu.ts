@@ -16,11 +16,14 @@ import {
   buildThreadActionMenuItems,
   type ThreadActionMenuId,
 } from "../components/threadActionMenu.logic";
+import { resolveThreadForkMenuState } from "../components/threadFork.logic";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { threadEnvironment } from "../state/threads";
 import { useAtomCommand } from "../state/use-atom-command";
 import {
+  readEnvironmentProviders,
   readEnvironmentSupportsAutoSettleOptOut,
+  readEnvironmentSupportsThreadRecovery,
   readEnvironmentSupportsPinning,
   readEnvironmentSupportsSettlement,
   readEnvironmentSupportsSnooze,
@@ -41,6 +44,7 @@ import { useCopyToClipboard } from "./useCopyToClipboard";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { useClientSettings } from "./useSettings";
 import { useThreadActions } from "./useThreadActions";
+import { useThreadFork } from "./useThreadFork";
 
 function failureToast(title: string, error: unknown) {
   toastManager.add(
@@ -90,6 +94,7 @@ export function useThreadActionMenu(input: {
     pinThread,
     confirmAndUnpinThread,
     setThreadAutoSettle,
+    setThreadRecovery,
     archiveThread,
     deleteThread,
   } = useThreadActions();
@@ -97,6 +102,7 @@ export function useThreadActionMenu(input: {
     reportFailure: false,
   });
   const handleNewThread = useNewThreadHandler();
+  const forkThread = useThreadFork();
   const markThreadUnread = useUiStateStore((s) => s.markThreadUnread);
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
@@ -155,6 +161,13 @@ export function useThreadActionMenu(input: {
           isRunning: thread.session?.status === "running" && thread.session.activeTurnId != null,
           supports,
           snoozePresets,
+          recovery: readEnvironmentSupportsThreadRecovery(threadRef.environmentId)
+            ? { enabled: thread.automaticRecovery === true }
+            : undefined,
+          fork: resolveThreadForkMenuState({
+            thread,
+            providers: readEnvironmentProviders(threadRef.environmentId),
+          }),
         });
         const clicked = await settlePromise(() => api.contextMenu.show(items, position));
         if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -235,6 +248,12 @@ export function useThreadActionMenu(input: {
               setThreadAutoSettle(threadRef, action === "auto-settle:enabled"),
             );
             return;
+          case "recovery:enabled":
+          case "recovery:disabled":
+            await reportFailure("Failed to update automatic recovery", () =>
+              setThreadRecovery(threadRef, action === "recovery:enabled"),
+            );
+            return;
           case "rename":
             onStartRename();
             return;
@@ -249,6 +268,9 @@ export function useThreadActionMenu(input: {
             return;
           case "mark-unread":
             markThreadUnread(scopedThreadKey(threadRef), thread.latestTurn?.completedAt);
+            return;
+          case "fork":
+            await forkThread(threadRef);
             return;
           case "copy-path": {
             const workspacePath = thread.worktreePath ?? projectCwd;
@@ -334,6 +356,7 @@ export function useThreadActionMenu(input: {
       copyPathToClipboard,
       copyThreadIdToClipboard,
       deleteThread,
+      forkThread,
       handleNewThread,
       logicalProjectKeyByPhysicalKey,
       markThreadUnread,
@@ -344,6 +367,7 @@ export function useThreadActionMenu(input: {
       projects,
       router,
       setThreadAutoSettle,
+      setThreadRecovery,
       settleThread,
       snoozeThread,
       threadRef,

@@ -116,6 +116,20 @@ describe("buildThreadActionMenuItems", () => {
     ).not.toContain("auto-settle");
   });
 
+  it("offers automatic recovery only when the server supports it, with the current option checked", () => {
+    const find = (state: ThreadActionMenuState) =>
+      buildThreadActionMenuItems(state).find((item) => item.id === "recovery");
+    expect(find(baseState)).toBeUndefined();
+    const on = find({ ...baseState, recovery: { enabled: true } });
+    expect(on?.label).toBe("Automatic recovery");
+    expect(on?.children?.map((child) => [child.id, child.checked])).toEqual([
+      ["recovery:enabled", true],
+      ["recovery:disabled", false],
+    ]);
+    const off = find({ ...baseState, recovery: { enabled: false } });
+    expect(off?.children?.map((child) => child.checked)).toEqual([false, true]);
+  });
+
   it("disables snooze when the thread cannot snooze, keeping presets visible", () => {
     const snooze = buildThreadActionMenuItems({ ...baseState, canSnoozeNow: false }).find(
       (item) => item.id === "snooze",
@@ -158,6 +172,17 @@ describe("buildThreadActionMenuItems", () => {
         },
       }),
     ).toContain("archive");
+  });
+
+  it("offers Fork only when the server and provider can fork, disabled while unsafe", () => {
+    expect(ids(baseState)).not.toContain("fork");
+    const forkItem = (disabled: boolean) =>
+      buildThreadActionMenuItems({ ...baseState, fork: { disabled } }).find(
+        (item) => item.id === "fork",
+      );
+    expect(forkItem(false)).toMatchObject({ label: "Fork thread" });
+    expect(forkItem(false)?.disabled).toBe(false);
+    expect(forkItem(true)?.disabled).toBe(true);
   });
 
   it("disables archive while the thread is running", () => {

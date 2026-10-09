@@ -17,12 +17,16 @@ export type ThreadActionMenuId =
   | "auto-settle"
   | "auto-settle:enabled"
   | "auto-settle:disabled"
+  | "recovery"
+  | "recovery:enabled"
+  | "recovery:disabled"
   | "snooze"
   | `snooze:${string}`
   | "unsnooze"
   | "rename"
   | "regenerate-title"
   | "mark-unread"
+  | "fork"
   | "copy"
   | "copy-path"
   | "copy-branch"
@@ -59,6 +63,17 @@ export interface ThreadActionMenuState {
     readonly titleRegeneration: boolean;
   };
   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
+  /**
+   * Absent when the server or provider cannot fork the thread, so the item
+   * must not show. `disabled` while the source has no safely completed history.
+   */
+  readonly fork?: { readonly disabled: boolean } | undefined;
+  /**
+   * Automatic recovery of this thread's turns after a provider outage or an
+   * exhausted usage window. Absent when the server cannot do it, so the item
+   * must not show.
+   */
+  readonly recovery?: { readonly enabled: boolean } | undefined;
 }
 
 /**
@@ -127,6 +142,16 @@ export function buildThreadActionMenuItems(
         ]
       : []),
     { id: "mark-unread", label: "Mark unread", icon: "mail-open" },
+    ...(state.fork
+      ? [
+          {
+            id: "fork" as const,
+            label: "Fork thread",
+            icon: "git-branch",
+            disabled: state.fork.disabled,
+          },
+        ]
+      : []),
     ...(state.projectFilter
       ? [
           {
@@ -158,6 +183,27 @@ export function buildThreadActionMenuItems(
                 id: "auto-settle:disabled" as const,
                 label: "Disabled",
                 checked: !state.autoSettleEnabled,
+              },
+            ],
+          },
+        ]
+      : []),
+    ...(state.recovery
+      ? [
+          {
+            id: "recovery" as const,
+            label: "Automatic recovery",
+            icon: "timer",
+            children: [
+              {
+                id: "recovery:enabled" as const,
+                label: "On",
+                checked: state.recovery.enabled,
+              },
+              {
+                id: "recovery:disabled" as const,
+                label: "Off",
+                checked: !state.recovery.enabled,
               },
             ],
           },

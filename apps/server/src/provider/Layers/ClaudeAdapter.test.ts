@@ -4272,6 +4272,132 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("tags a dropped SDK connection as a transport error without leaking its text", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello", attachments: [] });
+
+      // The code sits one level down, as it does when the SDK wraps a socket error.
+      harness.query.fail(
+        new Error("request failed with key sk-secret-123", {
+          cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+        }),
+      );
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const runtimeError = runtimeEvents.find((event) => event.type === "runtime.error");
+      assert.equal(runtimeError?.type, "runtime.error");
+      if (runtimeError?.type === "runtime.error") {
+        assert.equal(runtimeError.payload.class, "transport_error");
+        assert.equal(runtimeError.payload.message, "Claude runtime stream failed (ECONNRESET).");
+        // Only the whitelisted code and structural counts leave the adapter.
+        assert.deepEqual(runtimeError.payload.detail, {
+          failureCount: 1,
+          failureTags: ["ProviderAdapterProcessError"],
+        });
+      }
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.errorMessage, "Claude runtime stream failed (ECONNRESET).");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("readThread reports native tool calls that never received a result", () => {
+    let messages: ReadonlyArray<unknown> | "unreadable" = [];
+    const harness = makeHarness({
+      getSessionMessages: (async () => {
+        if (messages === "unreadable") throw new Error("session file unreadable");
+        return messages;
+      }) as never,
+    });
+    const human = {
+      type: "user",
+      uuid: "human-1",
+      parent_tool_use_id: null,
+      message: { role: "user", content: "hello" },
+    };
+    const call = (id: string) => ({
+      type: "assistant",
+      uuid: `use-${id}`,
+      parent_tool_use_id: null,
+      message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: {} }] },
+    });
+    const result = (id: string) => ({
+      type: "user",
+      uuid: `result-${id}`,
+      parent_tool_use_id: null,
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id }] },
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello", attachments: [] });
+      harness.query.emit({
+        type: "system",
+        subtype: "init",
+        session_id: "sdk-session-1",
+        uuid: "init-1",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+
+      const itemsOf = (snapshot: { readonly turns: ReadonlyArray<{ readonly items: unknown }> }) =>
+        snapshot.turns.at(-1)?.items ?? [];
+
+      messages = [human, call("a"), result("a"), call("b")];
+      assert.deepEqual(itemsOf(yield* adapter.readThread(THREAD_ID)), [
+        { type: "tool_use", id: "b", name: "Bash", status: "in_progress" },
+      ]);
+
+      messages = [human, call("a"), result("a")];
+      assert.deepEqual(itemsOf(yield* adapter.readThread(THREAD_ID)), []);
+
+      messages = [human, call("b"), { ...human, uuid: "queued-steer", isQueuedCommand: true }];
+      assert.deepEqual(itemsOf(yield* adapter.readThread(THREAD_ID)), [
+        { type: "tool_use", id: "b", name: "Bash", status: "in_progress" },
+      ]);
+
+      // Older turns do not count: only the newest human turn is reconciled.
+      messages = [human, call("old"), { ...human, uuid: "human-2" }, call("a"), result("a")];
+      assert.deepEqual(itemsOf(yield* adapter.readThread(THREAD_ID)), []);
+
+      messages = "unreadable";
+      const unreadable = yield* Effect.exit(adapter.readThread(THREAD_ID));
+      assert.equal(unreadable._tag, "Failure");
+
+      messages = [];
+      const empty = yield* Effect.exit(adapter.readThread(THREAD_ID));
+      assert.equal(empty._tag, "Failure");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("closes the previous session before replacing an existing thread session", () => {
     const queries: FakeClaudeQuery[] = [];
     const layer = Layer.effect(
@@ -5018,6 +5144,70 @@ describe("ClaudeAdapterLive", () => {
           "Claude usage limit reached. This turn is paused until the 7-day limit resets.",
         ],
       );
+
+      runtimeEventsFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("reports a rejected window as blocking, and a covered or warning one as not", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const { runtimeEvents, runtimeEventsFiber, drainSdkMessages } =
+        yield* observeUsageLimitEvents(adapter, harness.query);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello", attachments: [] });
+
+      const nowSeconds = Math.floor((yield* Clock.currentTimeMillis) / 1000);
+      const resetsAt = nowSeconds + 60 * 60;
+      for (const [uuid, info] of [
+        [
+          "warning",
+          { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.9, resetsAt },
+        ],
+        [
+          "covered",
+          {
+            status: "rejected",
+            rateLimitType: "five_hour",
+            utilization: 1,
+            resetsAt,
+            overageStatus: "allowed",
+          },
+        ],
+        [
+          "rejected",
+          { status: "rejected", rateLimitType: "seven_day", resetsAt, overageStatus: "rejected" },
+        ],
+      ] as const) {
+        harness.query.emit({
+          type: "rate_limit_event",
+          rate_limit_info: info,
+          session_id: "sdk-session-blocked",
+          uuid,
+        } as unknown as SDKMessage);
+        yield* drainSdkMessages;
+      }
+
+      const updates = runtimeEvents.flatMap((event) =>
+        event.type === "account.rate-limits.updated" ? [event.payload.limits] : [],
+      );
+      assert.deepEqual(
+        updates.map((limits) => limits.blocked === true),
+        [false, false, true],
+      );
+      // Reaching the recovery reactor needs the reset time, not only the flag.
+      assert.equal(updates[2]?.windows[0]?.id, "seven_day");
+      assert.equal(updates[2]?.windows[0]?.usedPercent, 100);
+      assert.isString(updates[2]?.windows[0]?.resetsAt);
 
       runtimeEventsFiber.interruptUnsafe();
     }).pipe(
@@ -6848,7 +7038,17 @@ describe("ClaudeAdapterLive", () => {
   });
 
   it.effect("completed turns keep their ids but not the SDK messages", () => {
-    const harness = makeHarness();
+    // readThread reconciles with the native record, so a finished turn needs one.
+    const harness = makeHarness({
+      getSessionMessages: (async () => [
+        {
+          type: "user",
+          uuid: "human-1",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "hello" },
+        },
+      ]) as never,
+    });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
       const session = yield* adapter.startSession({
@@ -8442,5 +8642,99 @@ describe("ClaudeAdapterLive", () => {
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );
+  });
+
+  it.effect(
+    "forks a stopped Claude session into an independent native session without a turn",
+    () => {
+      const forkCalls: Array<Parameters<NonNullable<ClaudeAdapterLiveOptions["forkSession"]>>> = [];
+      const harness = makeHarness({
+        forkSession: async (...args) => {
+          forkCalls.push(args);
+          return { sessionId: CLAUDE_FORK_SESSION_ID };
+        },
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const sourceResumeCursor = {
+          threadId: THREAD_ID,
+          resume: "550e8400-e29b-41d4-a716-446655440010",
+          resumeSessionAt: "assistant-2",
+          turnCount: 2,
+          turnStartMessageIds: ["user-1", "user-2"],
+        };
+        const destinationThreadId = ThreadId.make("thread-claude-fork");
+
+        const result = yield* adapter.forkThread!({
+          sourceThreadId: THREAD_ID,
+          destinationThreadId,
+          sourceResumeCursor,
+          cwd: "/tmp/fork-workspace",
+          runtimeMode: "full-access",
+        });
+
+        assert.deepEqual(forkCalls, [
+          ["550e8400-e29b-41d4-a716-446655440010", { dir: "/tmp/fork-workspace" }],
+        ]);
+        // Native UUIDs are rewritten by the fork, so the source's boundaries and
+        // resume point must not leak into the new cursor.
+        assert.deepEqual(result.resumeCursor, {
+          threadId: destinationThreadId,
+          resume: CLAUDE_FORK_SESSION_ID,
+          turnCount: 2,
+          turnStartMessageIds: [null, null],
+        });
+        assert.equal(harness.getLastCreateQueryInput(), undefined);
+        assert.deepEqual(yield* adapter.listSessions(), []);
+        assert.equal(yield* adapter.hasSession(destinationThreadId), false);
+        assert.deepEqual(sourceResumeCursor.turnStartMessageIds, ["user-1", "user-2"]);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
+  it.effect("refuses to fork Claude without a resumable native session", () => {
+    const forkCalls: Array<unknown> = [];
+    const harness = makeHarness({
+      forkSession: async (...args) => {
+        forkCalls.push(args);
+        return { sessionId: CLAUDE_FORK_SESSION_ID };
+      },
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const error = yield* Effect.flip(
+        adapter.forkThread!({
+          sourceThreadId: THREAD_ID,
+          destinationThreadId: ThreadId.make("thread-claude-fork"),
+          sourceResumeCursor: { threadId: THREAD_ID, resume: "claude-thread-synthetic" },
+          runtimeMode: "full-access",
+        }),
+      );
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      assert.deepEqual(forkCalls, []);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("reports a failed native Claude fork without returning a cursor", () => {
+    const harness = makeHarness({
+      forkSession: async () => {
+        throw new Error("disk full");
+      },
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const error = yield* Effect.flip(
+        adapter.forkThread!({
+          sourceThreadId: THREAD_ID,
+          destinationThreadId: ThreadId.make("thread-claude-fork"),
+          sourceResumeCursor: { threadId: THREAD_ID, resume: CLAUDE_FORK_SESSION_ID, turnCount: 1 },
+          runtimeMode: "full-access",
+        }),
+      );
+      assert.equal(error._tag, "ProviderAdapterRequestError");
+    }).pipe(Effect.provide(harness.layer));
   });
 });

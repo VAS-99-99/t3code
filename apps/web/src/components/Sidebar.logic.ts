@@ -1015,6 +1015,39 @@ export function sortInboxThreadsByReturn<
   );
 }
 
+export interface InboxProjectGroup<T> {
+  /** The `environmentId:projectId` scope key used elsewhere in the sidebar. */
+  key: `${SidebarThreadSummary["environmentId"]}:${SidebarThreadSummary["projectId"]}`;
+  environmentId: SidebarThreadSummary["environmentId"];
+  projectId: SidebarThreadSummary["projectId"];
+  threads: T[];
+}
+
+/**
+ * "By project" Inbox view. Keys on environment + project id, never the name, so
+ * same-named projects on different environments stay apart. Takes the already
+ * filtered and sorted Inbox: groups appear in order of their first row and rows
+ * keep their order inside a group.
+ */
+export function groupInboxThreadsByProject<
+  T extends Pick<SidebarThreadSummary, "environmentId" | "projectId">,
+>(threads: readonly T[]): InboxProjectGroup<T>[] {
+  const groups = new Map<InboxProjectGroup<T>["key"], InboxProjectGroup<T>>();
+  for (const thread of threads) {
+    const key = `${thread.environmentId}:${thread.projectId}` as const;
+    const group = groups.get(key);
+    if (group) group.threads.push(thread);
+    else
+      groups.set(key, {
+        key,
+        environmentId: thread.environmentId,
+        projectId: thread.projectId,
+        threads: [thread],
+      });
+  }
+  return [...groups.values()];
+}
+
 /** The timestamp a working thread's elapsed label counts from: the running
     turn's start (request time until adoption), falling back to the session's
     last transition when the turn projection lags behind. Malformed

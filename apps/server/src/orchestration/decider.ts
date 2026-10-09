@@ -404,10 +404,33 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           interactionMode: command.interactionMode,
           branch: command.branch,
           worktreePath: command.worktreePath,
+          // Imported history never opts in; a fork or a new thread does.
+          automaticRecovery: command.automaticRecovery ?? command.historyImport !== true,
           createdAt: command.createdAt,
           updatedAt: command.createdAt,
         },
       };
+    }
+
+    case "thread.create-with-history": {
+      const { type: _type, messages, fork, ...fields } = command;
+      return yield* decideCommandSequence({
+        readModel,
+        commands: [
+          {
+            type: "thread.create",
+            ...fields,
+            historyImport: true,
+            automaticRecovery: fork !== undefined,
+          },
+          {
+            type: "thread.history.import",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            messages,
+          },
+        ],
+      });
     }
 
     case "thread.delete": {
@@ -880,6 +903,31 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           autoSettleDisabledAt: command.enabled ? null : (currentlyDisabledAt ?? occurredAt),
           updatedAt: unchanged ? thread.updatedAt : occurredAt,
+        },
+      };
+    }
+
+    case "thread.recovery.set": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const occurredAt = yield* nowIso;
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.recovery-set",
+        payload: {
+          threadId: command.threadId,
+          enabled: command.enabled,
+          // Repeating the current state keeps ordering stable (see thread.auto-settle.set).
+          updatedAt:
+            (thread.automaticRecovery ?? false) === command.enabled ? thread.updatedAt : occurredAt,
         },
       };
     }
@@ -2043,6 +2091,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             messageId: message.messageId,
             role: message.role,
             text: message.text,
+            ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+            ...(message.context !== undefined ? { context: message.context } : {}),
             turnId: null,
             streaming: false,
             createdAt: message.createdAt,

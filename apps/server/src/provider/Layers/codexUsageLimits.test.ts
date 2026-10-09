@@ -297,3 +297,35 @@ describe("mergeCodexRateLimits", () => {
     ).toBe(main);
   });
 });
+
+describe("codexRateLimitsToUpdate blocked evidence", () => {
+  const primary = { usedPercent: 40, resetsAt: 1_784_000_000, windowDurationMins: 300 };
+
+  it("flags a snapshot that names the limit Codex reached", () => {
+    const update = codexRateLimitsToUpdate({
+      primary,
+      secondary: { usedPercent: 100, resetsAt: 1_784_500_000, windowDurationMins: 10080 },
+      rateLimitReachedType: "rate_limit_reached",
+    });
+    expect(update?.blocked).toBe(true);
+    expect(update?.windows.map((window) => window.id)).toEqual(["primary", "secondary"]);
+  });
+
+  it("flags depleted credits even when every window reads below full", () => {
+    expect(
+      codexRateLimitsToUpdate({ primary, rateLimitReachedType: "workspace_owner_credits_depleted" })
+        ?.blocked,
+    ).toBe(true);
+  });
+
+  it("emits nothing for a sparse update that only names the limit", () => {
+    expect(codexRateLimitsToUpdate({ rateLimitReachedType: "rate_limit_reached" })).toBeUndefined();
+  });
+
+  it("leaves an ordinary update unflagged, and null means no limit was reached", () => {
+    expect(codexRateLimitsToUpdate({ primary })?.blocked).toBeUndefined();
+    expect(
+      codexRateLimitsToUpdate({ primary, rateLimitReachedType: null })?.blocked,
+    ).toBeUndefined();
+  });
+});

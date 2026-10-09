@@ -132,6 +132,7 @@ export function applyThreadDetailEvent(
           unsettledAt: null,
           activeOrderKey: null,
           autoSettleDisabledAt: null,
+          ...(event.payload.automaticRecovery === true ? { automaticRecovery: true } : {}),
           snoozedUntil: null,
           snoozedAt: null,
           deletedAt: null,
@@ -246,6 +247,16 @@ export function applyThreadDetailEvent(
         thread: {
           ...thread,
           pinOrderKey: event.payload.orderKey,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.recovery-set":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          automaticRecovery: event.payload.enabled,
           updatedAt: event.payload.updatedAt,
         },
       };

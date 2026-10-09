@@ -76,6 +76,7 @@ import {
   codexRateLimitsToUpdate,
   codexUsageLimitMessage,
   mergeCodexRateLimits,
+  USAGE_LIMIT_EXCEEDED_CODE,
 } from "./codexUsageLimits.ts";
 const isCodexAppServerProcessExitedError = Schema.is(CodexErrors.CodexAppServerProcessExitedError);
 const isCodexAppServerTransportError = Schema.is(CodexErrors.CodexAppServerTransportError);
@@ -2262,7 +2263,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
 
-  const startSession: CodexAdapterShape["startSession"] = (input) =>
+  // `fork` starts the session by forking a native Codex thread. That session
+  // only exists to obtain the new thread's cursor, so it is never registered.
+  const startSessionWith = (
+    input: Parameters<CodexAdapterShape["startSession"]>[0],
+    fork?: { readonly sourceProviderThreadId: string },
+  ) =>
     Effect.scoped(
       Effect.gen(function* () {
         if (input.provider !== undefined && input.provider !== PROVIDER) {
@@ -2274,7 +2280,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         }
 
         const existing = sessions.get(input.threadId);
-        if (existing && !existing.stopped) {
+        if (!fork && existing && !existing.stopped) {
           yield* Effect.suspend(() => stopSessionInternal(existing));
         }
 
@@ -2315,6 +2321,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(isCodexResumeCursorSchema(input.resumeCursor)
             ? { resumeCursor: input.resumeCursor }
             : {}),
+          ...(fork ? { forkFromThreadId: fork.sourceProviderThreadId } : {}),
           runtimeMode: input.runtimeMode,
           ...(input.modelSelection?.instanceId === boundInstanceId
             ? { model: input.modelSelection.model }
@@ -2366,7 +2373,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
-        const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
+        const eventFiber = yield* Stream.runForEach(fork ? Stream.empty : runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
             if (event.method === "turn/started" && event.turnId) {
@@ -2450,6 +2457,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                   type: "runtime.error",
                   payload: {
                     message: usageLimitMessage,
+                    // Typed so recovery never has to read the sentence above.
+                    code: USAGE_LIMIT_EXCEEDED_CODE,
                     class: "provider_error",
                     ...(turnError.message ? { detail: turnError.message } : {}),
                   },
@@ -2537,6 +2546,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
+        if (fork) {
+          yield* runtime.close;
+          return started;
+        }
+
         sessions.set(input.threadId, {
           threadId: input.threadId,
           scope: sessionScope,
@@ -2552,6 +2566,44 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         return started;
       }),
     );
+
+  const startSession: CodexAdapterShape["startSession"] = (input) => startSessionWith(input);
+
+  const forkThread: NonNullable<CodexAdapterShape["forkThread"]> = (input) => {
+    const source = input.sourceResumeCursor;
+    if (!isCodexResumeCursorSchema(source)) {
+      return Effect.fail(
+        new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "forkThread",
+          issue: "The source thread has no native Codex thread to fork.",
+        }),
+      );
+    }
+    return startSessionWith(
+      {
+        provider: PROVIDER,
+        threadId: input.destinationThreadId,
+        ...(input.cwd ? { cwd: input.cwd } : {}),
+        ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
+        runtimeMode: input.runtimeMode,
+      },
+      { sourceProviderThreadId: source.threadId },
+    ).pipe(
+      Effect.flatMap((session) =>
+        isCodexResumeCursorSchema(session.resumeCursor) &&
+        session.resumeCursor.threadId !== source.threadId
+          ? Effect.succeed({ resumeCursor: session.resumeCursor })
+          : Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "thread/fork",
+                detail: "Codex did not return a new native thread for the fork.",
+              }),
+            ),
+      ),
+    );
+  };
 
   const resolveAttachment = Effect.fn("resolveAttachment")(function* (
     input: ProviderSendTurnInput,
@@ -2804,9 +2856,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       promptlessTurnContinuation: true,
+      supportsConversationFork: true,
     },
     startSession,
     sendTurn,
+    forkThread,
     compaction: { type: "native", start: compactThread },
     interruptTurn,
     readThread,

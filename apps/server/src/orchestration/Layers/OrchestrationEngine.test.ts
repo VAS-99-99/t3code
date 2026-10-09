@@ -1717,6 +1717,111 @@ describe("OrchestrationEngine", () => {
     await runtime.dispose();
   });
 
+  effectIt.effect(
+    "rolls back a thread created with its history when a later event fails, then commits it whole on retry",
+    () =>
+      Effect.gen(function* () {
+        let failSettled = true;
+        const flakyProjectionPipeline: OrchestrationProjectionPipelineShape = {
+          bootstrap: Effect.void,
+          projectEvent: () => Effect.void,
+          projectEventDeferred: (event) => {
+            if (failSettled && event.type === "thread.settled") {
+              failSettled = false;
+              return Effect.fail(
+                new PersistenceSqlError({
+                  operation: "test.projection",
+                  detail: "projection failed",
+                }),
+              );
+            }
+            return Effect.succeed(Effect.void);
+          },
+        };
+        const services = yield* Layer.build(
+          OrchestrationEngineLive.pipe(
+            Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+            Layer.provide(ThreadBackgroundLiveness.layer),
+            Layer.provide(ThreadPlanProgress.layer),
+            Layer.provide(Layer.succeed(OrchestrationProjectionPipeline, flakyProjectionPipeline)),
+            Layer.provide(OrchestrationEventStoreLive),
+            Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+            Layer.provide(RepositoryIdentityResolver.layer),
+            Layer.provide(SqlitePersistenceMemory),
+            Layer.provide(NodeServices.layer),
+          ),
+        );
+        const engine = yield* OrchestrationEngineService.pipe(Effect.provide(services));
+        const createdAt = now();
+        yield* engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("cmd-project-fork-atomic"),
+          projectId: asProjectId("project-fork-atomic"),
+          title: "Project",
+          workspaceRoot: "/tmp/project-fork-atomic",
+          defaultModelSelection: null,
+          createdAt,
+        });
+        const command = {
+          type: "thread.create-with-history" as const,
+          commandId: CommandId.make("cmd-fork-atomic"),
+          threadId: ThreadId.make("thread-fork-atomic"),
+          projectId: asProjectId("project-fork-atomic"),
+          title: "Fork",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required" as const,
+          branch: null,
+          worktreePath: null,
+          createdAt,
+          messages: [
+            {
+              messageId: asMessageId("fork-atomic-1"),
+              role: "user" as const,
+              text: "Q",
+              createdAt,
+            },
+            {
+              messageId: asMessageId("fork-atomic-2"),
+              role: "assistant" as const,
+              text: "A",
+              createdAt,
+            },
+          ],
+        };
+        const readEventTypes = Stream.runCollect(engine.readEvents(0)).pipe(
+          Effect.map((chunk) => Array.from(chunk).map((event) => event.type)),
+        );
+
+        const failure = yield* engine.dispatch(command).pipe(Effect.flip);
+        expect(failure._tag).toBe("PersistenceSqlError");
+        // Nothing of the thread is visible: not the shell, not a partial history.
+        expect(yield* readEventTypes).toEqual(["project.created"]);
+        const writeToPartial = yield* engine
+          .dispatch({
+            type: "thread.message.user.append",
+            commandId: CommandId.make("cmd-fork-atomic-append"),
+            threadId: command.threadId,
+            message: { messageId: asMessageId("fork-atomic-user"), text: "hi", attachments: [] },
+            createdAt,
+          })
+          .pipe(Effect.flip);
+        expect(writeToPartial._tag).toBe("OrchestrationCommandInvariantError");
+
+        const retried = yield* engine.dispatch(command);
+        expect(yield* readEventTypes).toEqual([
+          "project.created",
+          "thread.created",
+          "thread.message-sent",
+          "thread.message-sent",
+          "thread.settled",
+        ]);
+        // The same command again is a replay, not a second thread.
+        expect(yield* engine.dispatch(command)).toEqual(retried);
+        expect(yield* readEventTypes).toHaveLength(5);
+      }).pipe(Effect.scoped),
+  );
+
   it("reconciles command state when append persists but projection fails", async () => {
     type StoredEvent =
       ReturnType<OrchestrationEventStoreShape["append"]> extends Effect.Effect<infer A, any, any>

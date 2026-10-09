@@ -18,6 +18,7 @@ import type {
   ProviderSessionStartInput,
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
+  RuntimeMode,
   ThreadId,
   ProviderTurnStartResult,
   TurnId,
@@ -52,6 +53,8 @@ export interface ProviderAdapterCapabilities {
   readonly promptlessTurnContinuation?: boolean;
   /** False when native conversation history cannot be rewound. */
   readonly supportsConversationRollback?: boolean;
+  /** True when `forkThread` can copy a conversation into a new native session. */
+  readonly supportsConversationFork?: boolean;
 }
 
 export interface ProviderThreadTurnSnapshot {
@@ -62,6 +65,22 @@ export interface ProviderThreadTurnSnapshot {
 export interface ProviderThreadSnapshot {
   readonly threadId: ThreadId;
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
+}
+
+export interface ProviderForkThreadInput {
+  readonly sourceThreadId: ThreadId;
+  /** The new thread the native fork will back. Never the source's id. */
+  readonly destinationThreadId: ThreadId;
+  /** Persisted cursor of the stopped source session. */
+  readonly sourceResumeCursor: unknown;
+  readonly cwd?: string | undefined;
+  readonly runtimeMode: RuntimeMode;
+  readonly modelSelection?: ProviderSessionStartInput["modelSelection"];
+}
+
+export interface ProviderForkThreadResult {
+  /** Cursor of the new native session. Resuming it never touches the source session. */
+  readonly resumeCursor: unknown;
 }
 
 export interface ProviderAdapterShape<TError> {
@@ -138,6 +157,15 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
+
+  /**
+   * Copy a stopped session's full native history into a new, independent
+   * native session and return its cursor. Omitted when the provider has no
+   * native history fork. Starts no turn and leaves the source untouched.
+   */
+  readonly forkThread?: (
+    input: ProviderForkThreadInput,
+  ) => Effect.Effect<ProviderForkThreadResult, TError>;
 
   /**
    * Upload a thread to the provider when the adapter supports feedback.

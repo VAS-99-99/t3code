@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 /**
  * ProviderServiceLive - Cross-provider orchestration layer.
  *
@@ -9,6 +10,8 @@
  *
  * @module ProviderServiceLive
  */
+import * as NodeUtil from "node:util";
+
 import {
   EventId,
   MessageId,
@@ -51,6 +54,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
@@ -1250,6 +1254,55 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     () => reconcileInstanceSubscriptions,
   ).pipe(Effect.forkScoped);
 
+  // Session start, turn admission and rollback of one thread may overlap each
+  // other, as they always have, but never a fork of that thread: the fork takes
+  // every permit, so no turn can enter the source between its snapshot and the
+  // native copy. The turnstile keeps a waiting fork from being starved by new
+  // admissions. Nothing under a permit calls back into a method that takes one:
+  // compaction and recovery reach adapters directly.
+  // ponytail: two small semaphores stay per thread seen, drop idle ones if that ever adds up.
+  const MAX_ADMISSIONS = 1_000_000;
+  const admissions = new Map<
+    ThreadId,
+    { readonly turnstile: Semaphore.Semaphore; readonly room: Semaphore.Semaphore }
+  >();
+  const admissionFor = (threadId: ThreadId) => {
+    let admission = admissions.get(threadId);
+    if (admission === undefined) {
+      admission = {
+        turnstile: Semaphore.makeUnsafe(1),
+        room: Semaphore.makeUnsafe(MAX_ADMISSIONS),
+      };
+      admissions.set(threadId, admission);
+    }
+    return admission;
+  };
+  const withThreadAdmission =
+    (threadId: ThreadId) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+      const { turnstile, room } = admissionFor(threadId);
+      return turnstile.withPermit(Effect.void).pipe(Effect.andThen(room.withPermit(effect)));
+    };
+  const withExclusiveThreadAdmission =
+    (threadId: ThreadId) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+      const { turnstile, room } = admissionFor(threadId);
+      return turnstile.withPermit(room.withPermits(MAX_ADMISSIONS)(effect));
+    };
+
+  // Fork callers share a destination lock, separate from session admission:
+  // an SDK call may itself dispatch work to an ordinary destination thread.
+  // ponytail: retain one semaphore per fork destination; drop idle entries if this grows.
+  const forkDestinations = new Map<ThreadId, Semaphore.Semaphore>();
+  const forkDestination = (threadId: ThreadId) => {
+    let lock = forkDestinations.get(threadId);
+    if (lock === undefined) {
+      lock = Semaphore.makeUnsafe(1);
+      forkDestinations.set(threadId, lock);
+    }
+    return lock;
+  };
+
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
     readonly binding: ProviderSessionDirectory.ProviderRuntimeBinding;
     readonly operation: string;
@@ -1588,6 +1641,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               operation: "start",
             }),
         }),
+        withThreadAdmission(threadId),
       );
     },
   );
@@ -1834,6 +1888,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             },
           }),
       }),
+      withThreadAdmission(input.threadId),
     );
   });
 
@@ -2295,7 +2350,282 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             operation: "rollback",
           }),
       }),
+      withThreadAdmission(input.threadId),
     );
+  });
+
+  const forkConversation: ProviderServiceMethod<"forkConversation"> = Effect.fn("forkConversation")(
+    function* <E>(input: ProviderService.ProviderForkConversationInput<E>) {
+      const operation = "ProviderService.forkConversation";
+      const fork = { threadId: input.sourceThreadId, commandId: input.commandId };
+      const store = directory.forks;
+      if (store === undefined || input.sourceThreadId === input.destinationThreadId) {
+        return yield* toValidationError(
+          operation,
+          "An independent persistent fork destination is required.",
+        );
+      }
+      return yield* Effect.gen(function* () {
+        const staged = Option.getOrUndefined(yield* store.get(input.destinationThreadId));
+        if (staged) {
+          return staged.sourceThreadId === input.sourceThreadId &&
+            staged.commandId === input.commandId
+            ? { created: false, captured: staged.captured }
+            : yield* toValidationError(
+                operation,
+                `Thread '${input.destinationThreadId}' belongs to another fork request.`,
+              );
+        }
+        const existing = Option.getOrUndefined(
+          yield* directory.getBinding(input.destinationThreadId),
+        );
+        if (existing) {
+          return yield* toValidationError(
+            operation,
+            `Thread '${input.destinationThreadId}' already has a provider session.`,
+          );
+        }
+        return yield* Effect.gen(function* () {
+          // The caller's view of the source is taken here, where no turn can enter it.
+          const captured = yield* input.capture;
+          const source = Option.getOrUndefined(yield* directory.getBinding(input.sourceThreadId));
+          if (!source) {
+            return yield* toValidationError(
+              operation,
+              `Thread '${input.sourceThreadId}' has no provider session to fork.`,
+            );
+          }
+          const instanceId = yield* requireBindingInstanceId(operation, source);
+          const adapter = yield* registry.getByInstance(instanceId);
+          if (adapter.forkThread === undefined) {
+            return yield* toValidationError(
+              operation,
+              `Provider '${adapter.provider}' does not support conversation forks.`,
+            );
+          }
+          const inspectSource = Effect.gen(function* () {
+            const binding = Option.getOrUndefined(
+              yield* directory.getBinding(input.sourceThreadId),
+            );
+            const active = (yield* adapter.listSessions()).find(
+              (session) => session.threadId === input.sourceThreadId,
+            );
+            return {
+              running:
+                binding?.status === "starting" ||
+                pendingCompactions.has(input.sourceThreadId) ||
+                // Completed live turns can leave a persisted active id. Under
+                // source admission, the live adapter owns the current turn state.
+                (active !== undefined
+                  ? active.status !== "ready" || active.activeTurnId != null
+                  : binding === undefined || !isSettledBinding(binding)),
+              // An open session's cursor is fresher than the persisted one.
+              cursor: active?.resumeCursor ?? binding?.resumeCursor,
+            };
+          });
+          const before = yield* inspectSource;
+          if (before.running) {
+            return yield* toValidationError(
+              operation,
+              `Thread '${input.sourceThreadId}' is running. Fork it after its turn completes.`,
+            );
+          }
+          if (before.cursor == null) {
+            return yield* toValidationError(
+              operation,
+              `Thread '${input.sourceThreadId}' has no native session history to fork yet.`,
+            );
+          }
+          const cwd = readPersistedCwd(source.runtimePayload);
+          const modelSelection = readPersistedModelSelection(source.runtimePayload);
+          const runtimeMode = source.runtimeMode ?? "full-access";
+          const forked = yield* adapter.forkThread({
+            sourceThreadId: input.sourceThreadId,
+            destinationThreadId: input.destinationThreadId,
+            sourceResumeCursor: before.cursor,
+            ...(cwd ? { cwd } : {}),
+            runtimeMode,
+            ...(modelSelection ? { modelSelection } : {}),
+          });
+          // Providers copy whatever their session holds when asked. Turns that
+          // started on their own (outside this service) would be in the copy but
+          // not in what the caller captured, so the copy is only kept if the source
+          // did not move.
+          const after = yield* inspectSource;
+          if (after.running || !NodeUtil.isDeepStrictEqual(after.cursor, before.cursor)) {
+            return yield* toValidationError(
+              operation,
+              `Thread '${input.sourceThreadId}' changed while it was being forked. Try again.`,
+            );
+          }
+          if (
+            forked.resumeCursor == null ||
+            NodeUtil.isDeepStrictEqual(forked.resumeCursor, before.cursor)
+          ) {
+            return yield* toValidationError(
+              operation,
+              `Provider '${adapter.provider}' did not create an independent native session.`,
+            );
+          }
+          // Staging is deliberately separate from routable bindings. A concurrent
+          // ordinary destination cannot inherit this copy, even if publication fails.
+          yield* store.stage({
+            destinationThreadId: input.destinationThreadId,
+            sourceThreadId: input.sourceThreadId,
+            commandId: input.commandId,
+            captured,
+            binding: {
+              provider: source.provider,
+              providerInstanceId: instanceId,
+              runtimeMode,
+              resumeCursor: forked.resumeCursor,
+              runtimePayload: {
+                ...(cwd ? { cwd } : {}),
+                ...(modelSelection ? { modelSelection } : {}),
+                forkedFrom: { ...fork, captured },
+              },
+            },
+          });
+          const accepted = Option.getOrUndefined(yield* store.get(input.destinationThreadId));
+          if (
+            accepted?.sourceThreadId !== input.sourceThreadId ||
+            accepted.commandId !== input.commandId
+          ) {
+            return yield* toValidationError(
+              operation,
+              "Another request owns the accepted fork destination.",
+            );
+          }
+          yield* analytics.record("provider.conversation.forked", { provider: adapter.provider });
+          return { created: true, captured: accepted.captured };
+        }).pipe(withExclusiveThreadAdmission(input.sourceThreadId));
+      }).pipe(
+        Effect.tap((result) =>
+          input.publish === undefined
+            ? Effect.void
+            : input.publish(result).pipe(withExclusiveThreadAdmission(input.destinationThreadId)),
+        ),
+        forkDestination(input.destinationThreadId).withPermit,
+      );
+    },
+  );
+
+  const readConversation: ProviderServiceMethod<"readConversation"> = Effect.fn("readConversation")(
+    function* (threadId) {
+      return yield* Effect.gen(function* () {
+        const routed = yield* resolveRoutableSession({
+          threadId,
+          operation: "ProviderService.readConversation",
+          allowRecovery: true,
+        });
+        return yield* routed.adapter.readThread(routed.threadId);
+      }).pipe(withThreadAdmission(threadId));
+    },
+  );
+
+  const transferConversation: ProviderServiceMethod<"transferConversation"> = Effect.fn(
+    "transferConversation",
+  )(function* <E>(input: ProviderService.ProviderTransferConversationInput<E>) {
+    const operation = "ProviderService.transferConversation";
+    const { threadId, toInstanceId } = input;
+    return yield* Effect.gen(function* () {
+      const source = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      if (!source) {
+        return yield* toValidationError(operation, `Thread '${threadId}' has no provider session.`);
+      }
+      const fromInstanceId = yield* requireBindingInstanceId(operation, source);
+      if (fromInstanceId === toInstanceId) {
+        return yield* toValidationError(
+          operation,
+          `Thread '${threadId}' already uses this account.`,
+        );
+      }
+      const fromInfo = yield* registry.getInstanceInfo(fromInstanceId);
+      const toInfo = yield* registry.getInstanceInfo(toInstanceId);
+      if (!toInfo.enabled || toInfo.driverKind !== fromInfo.driverKind) {
+        return yield* toValidationError(
+          operation,
+          `Provider instance '${toInstanceId}' is not an enabled '${fromInfo.driverKind}' account.`,
+        );
+      }
+      const fromAdapter = yield* registry.getByInstance(fromInstanceId);
+      const toAdapter = yield* registry.getByInstance(toInstanceId);
+      const live = (yield* fromAdapter.listSessions()).find(
+        (session) => session.threadId === threadId,
+      );
+      if (
+        source.status === "starting" ||
+        pendingCompactions.has(threadId) ||
+        (live !== undefined && (live.status !== "ready" || live.activeTurnId != null))
+      ) {
+        return yield* toValidationError(
+          operation,
+          `Thread '${threadId}' is running. Move it after its turn stops.`,
+        );
+      }
+      // An open session's cursor is fresher than the persisted one.
+      const cursor = live?.resumeCursor ?? source.resumeCursor;
+      if (cursor == null) {
+        return yield* toValidationError(
+          operation,
+          `Thread '${threadId}' has no native session history to move.`,
+        );
+      }
+      const cwd = readPersistedCwd(source.runtimePayload);
+      const modelSelection = readPersistedModelSelection(source.runtimePayload);
+      const runtimeMode = source.runtimeMode ?? "full-access";
+      let nextCursor = input.stagedCursor;
+      if (nextCursor == null) {
+        // The target's own configuration must find the history; driver equality proves nothing.
+        if (toAdapter.forkThread === undefined) {
+          return yield* toValidationError(
+            operation,
+            `Provider '${toAdapter.provider}' does not support conversation forks.`,
+          );
+        }
+        const forked = yield* toAdapter.forkThread({
+          sourceThreadId: threadId,
+          destinationThreadId: threadId,
+          sourceResumeCursor: cursor,
+          ...(cwd ? { cwd } : {}),
+          runtimeMode,
+          ...(modelSelection
+            ? { modelSelection: { ...modelSelection, instanceId: toInstanceId } }
+            : {}),
+        });
+        if (
+          forked.resumeCursor == null ||
+          NodeUtil.isDeepStrictEqual(forked.resumeCursor, cursor)
+        ) {
+          return yield* toValidationError(
+            operation,
+            `Provider '${toAdapter.provider}' did not create an independent native session.`,
+          );
+        }
+        if (input.onForked) yield* input.onForked(forked.resumeCursor);
+        nextCursor = forked.resumeCursor;
+      }
+      if (live) yield* fromAdapter.stopSession(threadId);
+      yield* directory.upsert({
+        threadId,
+        provider: toInfo.driverKind,
+        providerInstanceId: toInstanceId,
+        runtimeMode,
+        status: "stopped",
+        resumeCursor: nextCursor,
+        runtimePayload: {
+          activeTurnId: null,
+          lastError: null,
+          ...(modelSelection
+            ? { modelSelection: { ...modelSelection, instanceId: toInstanceId } }
+            : {}),
+          transferredFrom: fromInstanceId,
+        },
+      });
+      yield* analytics.record("provider.conversation.transferred", {
+        provider: toInfo.driverKind,
+      });
+    }).pipe(withExclusiveThreadAdmission(threadId));
   });
 
   const uploadFeedback: ProviderServiceMethod<"uploadFeedback"> = Effect.fn("uploadFeedback")(
@@ -2462,6 +2792,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getInstanceInfo,
     assertConversationRollbackSupported,
     rollbackConversation,
+    forkConversation,
+    readConversation,
+    transferConversation,
     uploadFeedback,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each

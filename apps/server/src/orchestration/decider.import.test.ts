@@ -506,4 +506,213 @@ it.layer(NodeServices.layer)("thread history import", (it) => {
       }
     }),
   );
+
+  it.effect(
+    "keeps attachments and context on imported messages through projection and revert",
+    () =>
+      Effect.gen(function* () {
+        const createdAt = "2026-08-24T10:00:00.000Z";
+        const threadId = ThreadId.make("fork-destination");
+        const readModel = yield* projectEvent(createEmptyReadModel(createdAt), {
+          sequence: 1,
+          eventId: EventId.make("event-fork-thread-created"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          type: "thread.created",
+          occurredAt: createdAt,
+          commandId: CommandId.make("command-fork-thread-created"),
+          causationEventId: null,
+          correlationId: CommandId.make("command-fork-thread-created"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Fork",
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        });
+        const attachment = {
+          type: "image" as const,
+          id: "fork-destination-123e4567-e89b-42d3-a456-426614174000",
+          name: "shot.png",
+          mimeType: "image/png",
+          sizeBytes: 3,
+        };
+        const context = { version: 1 as const, records: [] };
+
+        const events = yield* decideOrchestrationCommand({
+          command: {
+            type: "thread.history.import",
+            commandId: CommandId.make("command-fork-history"),
+            threadId,
+            messages: [
+              {
+                messageId: MessageId.make("import:fork:fork-destination:000000"),
+                role: "user",
+                text: "Look at this",
+                attachments: [attachment],
+                context,
+                createdAt,
+              },
+            ],
+          },
+          readModel,
+        });
+        const planned = Array.isArray(events) ? events : [events];
+        expect(planned[0]).toMatchObject({
+          type: "thread.message-sent",
+          payload: { attachments: [attachment], context },
+        });
+
+        let projected = readModel;
+        for (const [index, event] of planned.entries()) {
+          projected = yield* projectEvent(projected, { ...event, sequence: index + 2 });
+        }
+        projected = yield* projectEvent(projected, {
+          sequence: 10,
+          eventId: EventId.make("event-fork-reverted"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          type: "thread.reverted",
+          occurredAt: "2026-08-24T10:02:00.000Z",
+          commandId: CommandId.make("command-fork-reverted"),
+          causationEventId: null,
+          correlationId: CommandId.make("command-fork-reverted"),
+          metadata: {},
+          payload: { threadId, turnCount: 0 },
+        });
+        expect(projected.threads[0]?.messages[0]).toMatchObject({
+          text: "Look at this",
+          attachments: [attachment],
+          context,
+        });
+      }),
+  );
+
+  const projectCreated = Effect.fn("projectCreated")(function* (createdAt: string) {
+    const projectId = ProjectId.make("project-with-history");
+    return yield* projectEvent(createEmptyReadModel(createdAt), {
+      sequence: 1,
+      eventId: EventId.make("event-with-history-project"),
+      aggregateKind: "project",
+      aggregateId: projectId,
+      type: "project.created",
+      occurredAt: createdAt,
+      commandId: CommandId.make("command-with-history-project"),
+      causationEventId: null,
+      correlationId: CommandId.make("command-with-history-project"),
+      metadata: {},
+      payload: {
+        projectId,
+        title: "Project",
+        workspaceRoot: "/tmp/project",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+  });
+  const createWithHistory = (threadId: ThreadId, createdAt: string) => ({
+    type: "thread.create-with-history" as const,
+    commandId: CommandId.make(`command-create-with-history-${threadId}`),
+    threadId,
+    projectId: ProjectId.make("project-with-history"),
+    title: "Forked thread",
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+    runtimeMode: "full-access" as const,
+    interactionMode: "default" as const,
+    branch: null,
+    worktreePath: null,
+    createdAt,
+    messages: [
+      { messageId: MessageId.make(`${threadId}:0`), role: "user" as const, text: "Q", createdAt },
+      {
+        messageId: MessageId.make(`${threadId}:1`),
+        role: "assistant" as const,
+        text: "A",
+        createdAt,
+      },
+    ],
+  });
+
+  it.effect("creates a thread together with its imported history in one decision", () =>
+    Effect.gen(function* () {
+      const createdAt = "2026-08-24T10:00:00.000Z";
+      const threadId = ThreadId.make("thread-with-history");
+      const readModel = yield* projectCreated(createdAt);
+      const command = createWithHistory(threadId, createdAt);
+
+      const decided = yield* decideOrchestrationCommand({ command, readModel });
+      const planned = Array.isArray(decided) ? decided : [decided];
+
+      expect(planned.map((event) => event.type)).toEqual([
+        "thread.created",
+        "thread.message-sent",
+        "thread.message-sent",
+        "thread.settled",
+      ]);
+      for (const event of planned) {
+        expect(event.commandId).toBe(command.commandId);
+        expect(event.metadata).toEqual({ historyImport: true });
+      }
+      let projected = readModel;
+      for (const [index, event] of planned.entries()) {
+        projected = yield* projectEvent(projected, { ...event, sequence: index + 2 });
+      }
+      const thread = projected.threads.find((entry) => entry.id === threadId);
+      expect(thread?.messages.map((message) => message.text)).toEqual(["Q", "A"]);
+
+      // The history guard is untouched: a thread that has messages takes no import.
+      const error = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "thread.history.import",
+            commandId: CommandId.make("command-with-history-reimport"),
+            threadId,
+            messages: [{ messageId: MessageId.make("late"), role: "user", text: "L", createdAt }],
+          },
+          readModel: projected,
+        }),
+      );
+      expect(error.message).toContain("must be active and empty");
+    }),
+  );
+
+  it.effect("creates nothing when the thread exists or the project does not", () =>
+    Effect.gen(function* () {
+      const createdAt = "2026-08-24T10:00:00.000Z";
+      const threadId = ThreadId.make("thread-with-history-rejected");
+      const readModel = yield* projectCreated(createdAt);
+      const command = createWithHistory(threadId, createdAt);
+      const decided = yield* decideOrchestrationCommand({ command, readModel });
+      let projected = readModel;
+      for (const [index, event] of (Array.isArray(decided) ? decided : [decided]).entries()) {
+        projected = yield* projectEvent(projected, { ...event, sequence: index + 2 });
+      }
+
+      const duplicate = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: { ...command, commandId: CommandId.make("command-with-history-duplicate") },
+          readModel: projected,
+        }),
+      );
+      const orphan = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: { ...command, projectId: ProjectId.make("project-missing") },
+          readModel: createEmptyReadModel(createdAt),
+        }),
+      );
+
+      expect(duplicate._tag).toBe("OrchestrationCommandInvariantError");
+      expect(duplicate.message).toContain("already exists");
+      expect(orphan._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
 });

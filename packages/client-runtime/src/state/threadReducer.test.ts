@@ -330,6 +330,27 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 
+  describe("thread.recovery-set", () => {
+    it("turns automatic recovery on and off", () => {
+      const at = "2026-04-01T05:00:00.000Z";
+      const event = (enabled: boolean) => ({
+        ...baseEventFields,
+        sequence: 7,
+        occurredAt: at,
+        aggregateKind: "thread" as const,
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.recovery-set" as const,
+        payload: { threadId: ThreadId.make("thread-1"), enabled, updatedAt: at },
+      });
+      const on = applyThreadDetailEvent(baseThread, event(true));
+      expect(on.kind).toBe("updated");
+      if (on.kind !== "updated") return;
+      expect(on.thread.automaticRecovery).toBe(true);
+      const off = applyThreadDetailEvent(on.thread, event(false));
+      expect(off.kind === "updated" && off.thread.automaticRecovery).toBe(false);
+    });
+  });
+
   describe("thread.meta-updated", () => {
     it.each(["f", null] as const)(
       "updates the active key to %s without activity",

@@ -2956,6 +2956,7 @@ usageLimitLayer("CodexAdapterLive usage limits", (it) => {
         if (event.type === "runtime.error") {
           NodeAssert.equal(event.payload.message, expected);
           NodeAssert.equal(event.payload.detail, CODEX_OUT_OF_CREDITS);
+          NodeAssert.equal(event.payload.code, "usage_limit_exceeded");
         }
         if (event.type === "turn.completed") {
           NodeAssert.equal(event.payload.errorMessage, expected);
@@ -3192,4 +3193,145 @@ it.effect("managed turn failures preserve the sharing-limit code for client noti
     NodeAssert.equal(events[1]?.type, "turn.completed");
     if (events[1]?.type === "turn.completed") NodeAssert.equal(events[1].payload.state, "failed");
   }).pipe(Effect.provide(layer));
+});
+
+const nativeForkRuntimes: Array<FakeCodexRuntime> = [];
+const nativeForkFactory = vi.fn((options: CodexSessionRuntimeOptions) => {
+  const runtime = new FakeCodexRuntime(options);
+  runtime.startImpl.mockImplementation(() =>
+    Promise.resolve({
+      provider: ProviderDriverKind.make("codex"),
+      status: "ready" as const,
+      runtimeMode: options.runtimeMode,
+      threadId: options.threadId,
+      cwd: options.cwd,
+      resumeCursor: options.resumeCursor ?? { threadId: "native-fork" },
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    } satisfies ProviderSession),
+  );
+  if (options.forkFromThreadId === "native-fail") {
+    Object.assign(runtime, {
+      start: () =>
+        Effect.fail(
+          new CodexErrors.CodexAppServerRequestError({
+            code: -32603,
+            errorMessage: "rollout is missing",
+          }),
+        ),
+    });
+  }
+  nativeForkRuntimes.push(runtime);
+  return Effect.succeed(runtime);
+});
+
+it.layer(
+  Layer.effect(
+    CodexAdapter,
+    makeCodexAdapter(decodeCodexSettings({}), { makeRuntime: nativeForkFactory }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+)("CodexAdapterLive native fork", (it) => {
+  it.effect("does not stop a foreign live destination while making a detached native fork", () =>
+    Effect.gen(function* () {
+      nativeForkRuntimes.length = 0;
+      const adapter = yield* CodexAdapter;
+      const destination = asThreadId("foreign-live-destination");
+      yield* adapter.startSession({
+        threadId: destination,
+        runtimeMode: "full-access",
+        resumeCursor: { threadId: "foreign-native-history" },
+      });
+      const before = yield* adapter.listSessions();
+      const foreignRuntime = nativeForkRuntimes[0]!;
+      const result = yield* adapter.forkThread!({
+        sourceThreadId: asThreadId("foreign-live-source"),
+        destinationThreadId: destination,
+        sourceResumeCursor: { threadId: "native-source" },
+        runtimeMode: "full-access",
+      });
+      NodeAssert.deepStrictEqual(result, { resumeCursor: { threadId: "native-fork" } });
+      NodeAssert.equal(foreignRuntime.closeImpl.mock.calls.length, 0);
+      NodeAssert.deepStrictEqual(yield* adapter.listSessions(), before);
+      NodeAssert.equal(nativeForkRuntimes[1]!.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(foreignRuntime.sendTurnImpl.mock.calls.length, 0);
+      NodeAssert.equal(nativeForkRuntimes[1]!.sendTurnImpl.mock.calls.length, 0);
+      yield* adapter.stopSession(destination);
+    }),
+  );
+
+  it.effect("forks the persisted native thread into a new one and keeps no session open", () =>
+    Effect.gen(function* () {
+      nativeForkFactory.mockClear();
+      nativeForkRuntimes.length = 0;
+      const adapter = yield* CodexAdapter;
+      const sourceResumeCursor = { threadId: "native-source" };
+
+      const result = yield* adapter.forkThread!({
+        sourceThreadId: asThreadId("thread-source"),
+        destinationThreadId: asThreadId("thread-destination"),
+        sourceResumeCursor,
+        cwd: "/tmp/project",
+        runtimeMode: "approval-required",
+      });
+
+      NodeAssert.deepStrictEqual(result, { resumeCursor: { threadId: "native-fork" } });
+      NodeAssert.equal(nativeForkFactory.mock.calls.length, 1);
+      NodeAssert.deepStrictEqual(nativeForkFactory.mock.calls[0]?.[0], {
+        binaryPath: "codex",
+        cwd: "/tmp/project",
+        forkFromThreadId: "native-source",
+        launchArgs: "",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId: asThreadId("thread-destination"),
+        runtimeMode: "approval-required",
+      });
+      const runtime = nativeForkRuntimes[0]!;
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
+      NodeAssert.deepStrictEqual(yield* adapter.listSessions(), []);
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-destination")), false);
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-source")), false);
+      NodeAssert.deepStrictEqual(sourceResumeCursor, { threadId: "native-source" });
+    }),
+  );
+
+  it.effect("rejects a source cursor that has no native Codex thread", () =>
+    Effect.gen(function* () {
+      nativeForkFactory.mockClear();
+      const adapter = yield* CodexAdapter;
+      const error = yield* Effect.flip(
+        adapter.forkThread!({
+          sourceThreadId: asThreadId("thread-source"),
+          destinationThreadId: asThreadId("thread-destination"),
+          sourceResumeCursor: { resume: "claude-session" },
+          runtimeMode: "full-access",
+        }),
+      );
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      NodeAssert.equal(nativeForkFactory.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("closes the app-server and reports a failed native fork", () =>
+    Effect.gen(function* () {
+      nativeForkRuntimes.length = 0;
+      const adapter = yield* CodexAdapter;
+      const error = yield* Effect.flip(
+        adapter.forkThread!({
+          sourceThreadId: asThreadId("thread-source"),
+          destinationThreadId: asThreadId("thread-destination"),
+          sourceResumeCursor: { threadId: "native-fail" },
+          runtimeMode: "full-access",
+        }),
+      );
+      NodeAssert.equal(error._tag, "ProviderAdapterProcessError");
+      NodeAssert.equal(nativeForkRuntimes[0]?.closeImpl.mock.calls.length, 1);
+      NodeAssert.deepStrictEqual(yield* adapter.listSessions(), []);
+    }),
+  );
 });

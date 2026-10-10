@@ -223,6 +223,102 @@ function buildProps() {
   };
 }
 
+describe("mounted stopped result", () => {
+  it.each(["interrupted", "error"] as const)(
+    "renders a %s outcome on its user row before assistant text",
+    async (state) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      vi.stubGlobal("requestAnimationFrame", () => 0);
+      vi.stubGlobal("cancelAnimationFrame", () => {});
+      let renderer: ReactTestRenderer | undefined;
+      const turnId = TurnId.make("turn-stopped");
+      try {
+        await act(() => {
+          renderer = create(
+            <MessagesTimeline
+              {...buildProps()}
+              latestTurn={{
+                turnId,
+                state,
+                startedAt: MESSAGE_CREATED_AT,
+                completedAt: MESSAGE_CREATED_AT,
+              }}
+              timelineEntries={[
+                {
+                  id: "user",
+                  kind: "message",
+                  createdAt: MESSAGE_CREATED_AT,
+                  message: {
+                    id: MessageId.make("user"),
+                    role: "user",
+                    text: "Run checks",
+                    turnId: null,
+                    createdAt: MESSAGE_CREATED_AT,
+                    updatedAt: MESSAGE_CREATED_AT,
+                    streaming: false,
+                  },
+                },
+                {
+                  id: "cmd",
+                  kind: "work",
+                  createdAt: MESSAGE_CREATED_AT,
+                  entry: {
+                    id: "cmd",
+                    turnId,
+                    createdAt: MESSAGE_CREATED_AT,
+                    tone: "tool",
+                    label: "Ran command",
+                    itemType: "command_execution",
+                    command: "make",
+                    toolLifecycleStatus: "failed",
+                  },
+                },
+              ]}
+            />,
+          );
+        });
+        expect(renderer!.root.findAllByProps({ "data-task-result": "" })).toHaveLength(1);
+        expect(JSON.stringify(renderer!.toJSON())).toContain(
+          state === "error" ? "Ended with an error" : "Stopped before finishing",
+        );
+        await act(() =>
+          renderer!.update(
+            <MessagesTimeline
+              {...buildProps()}
+              isWorking
+              latestTurn={{
+                turnId,
+                state: "running",
+                startedAt: MESSAGE_CREATED_AT,
+                completedAt: null,
+              }}
+              timelineEntries={[
+                {
+                  id: "user",
+                  kind: "message",
+                  createdAt: MESSAGE_CREATED_AT,
+                  message: {
+                    id: MessageId.make("user"),
+                    role: "user",
+                    text: "Run checks",
+                    turnId,
+                    createdAt: MESSAGE_CREATED_AT,
+                    updatedAt: MESSAGE_CREATED_AT,
+                    streaming: false,
+                  },
+                },
+              ]}
+            />,
+          ),
+        );
+        expect(renderer!.root.findAllByProps({ "data-task-result": "" })).toHaveLength(0);
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    },
+  );
+});
+
 function buildLongUserMessageText(tail = "deep hidden detail only after expand") {
   return Array.from({ length: 9 }, (_, index) =>
     index === 8 ? tail : `Line ${index + 1}: ${"verbose prompt content ".repeat(8).trim()}`,

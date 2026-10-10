@@ -3,6 +3,7 @@ import { useAuth } from "@clerk/expo";
 import { SymbolView } from "../../components/AppSymbol";
 import {
   connectionStatusText,
+  describeServerDetails,
   type EnvironmentConnectionPhase,
 } from "@t3tools/client-runtime/connection";
 import {
@@ -233,6 +234,11 @@ function ConnectedCloudEnvironmentRow(props: {
         connectionState={enabled || unsupported ? props.environment.connectionState : "available"}
         errorExpanded={props.errorExpanded}
         label={props.environment.environmentLabel}
+        details={describeServerDetails({
+          connected: props.environment.connectionState === "connected",
+          serverConfig:
+            serverConfig ?? (lastDescriptor === undefined ? null : { environment: lastDescriptor }),
+        })}
         machine={resolveEnvironmentMachineKind(
           serverConfig ?? (lastDescriptor === undefined ? null : { environment: lastDescriptor }),
         )}
@@ -268,6 +274,13 @@ function CloudEnvironmentRow(props: {
       connectionState={presentation.connectionState}
       errorExpanded={props.errorExpanded}
       label={props.environment.environment.label}
+      details={describeServerDetails({
+        connected: false,
+        serverConfig:
+          props.environment.status?.descriptor === undefined
+            ? null
+            : { environment: props.environment.status.descriptor },
+      })}
       machine={resolveEnvironmentMachineKind(
         props.environment.status?.descriptor === undefined
           ? null
@@ -295,6 +308,7 @@ function CloudEnvironmentRowShell(props: {
   readonly disabled?: boolean;
   readonly errorExpanded: boolean;
   readonly label: string;
+  readonly details: string;
   readonly machine: EnvironmentMachineKind;
   readonly onToggleError: () => void;
   readonly onValueChange: (enabled: boolean) => void;
@@ -404,6 +418,9 @@ function CloudEnvironmentRowShell(props: {
             />
           ) : null}
         </StatusContainer>
+        <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+          {props.details}
+        </Text>
       </View>
       <ThemedSwitch
         style={{ alignSelf: "center" }}

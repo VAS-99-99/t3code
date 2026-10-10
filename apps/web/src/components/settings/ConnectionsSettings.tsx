@@ -41,7 +41,7 @@ import {
   type EnvironmentId,
   resolveEnvironmentMachineKind,
 } from "@t3tools/contracts";
-import { connectionStatusText } from "@t3tools/client-runtime/connection";
+import { connectionStatusText, describeServerDetails } from "@t3tools/client-runtime/connection";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -1590,11 +1590,19 @@ function SavedBackendListRow({
         </Tooltip>
       }
       below={
-        serverUpdateState.status !== "idle" ? (
-          <div className="mt-1 max-w-md">
-            <ServerUpdateProgress state={serverUpdateState} />
+        <>
+          <div className="truncate text-xs text-muted-foreground">
+            {describeServerDetails({
+              connected: isConnected,
+              serverConfig: environment.serverConfig,
+            })}
           </div>
-        ) : null
+          {serverUpdateState.status !== "idle" ? (
+            <div className="mt-1 max-w-md">
+              <ServerUpdateProgress state={serverUpdateState} />
+            </div>
+          ) : null}
+        </>
       }
     >
       {showUpdateAction ? (
@@ -3334,7 +3342,12 @@ export function ConnectionsSettings() {
                     <ServerUpdateProgress state={primaryServerUpdateState} />
                   ) : (
                     [
-                      primaryServerConfig?.environment.serverVersion ?? null,
+                      primaryServerConfig === null
+                        ? null
+                        : describeServerDetails({
+                            connected: primaryEnvironment?.connection.phase === "connected",
+                            serverConfig: primaryServerConfig,
+                          }),
                       primaryEnvironment?.displayUrl ?? null,
                     ]
                       .filter((value): value is string => value !== null)

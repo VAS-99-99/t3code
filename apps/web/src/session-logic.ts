@@ -42,6 +42,11 @@ import {
   type TurnDiffSummary,
 } from "./types";
 
+import {
+  recordedCommandStatus,
+  structuredCommandExitCode,
+} from "@t3tools/client-runtime/task-results";
+
 export type { PendingApproval, PendingUserInput } from "@t3tools/client-runtime/pending-requests";
 
 export { formatDuration } from "@t3tools/shared/orchestrationTiming";
@@ -65,6 +70,8 @@ export interface WorkLogEntry {
   viewedImagePath?: string;
   command?: string;
   rawCommand?: string;
+  /** Command exit code the provider reported (structured field or exit marker). Absent when not reported. */
+  exitCode?: number;
   changedFiles?: ReadonlyArray<string>;
   tone: "thinking" | "tool" | "info" | "error";
   toolTitle?: string;
@@ -613,6 +620,8 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   }
   if (commandPreview.command) {
     entry.command = commandPreview.command;
+    const exitCode = extractCommandExitCode(payload);
+    if (exitCode !== undefined) entry.exitCode = exitCode;
   }
   if (commandPreview.rawCommand) {
     entry.rawCommand = commandPreview.rawCommand;
@@ -861,11 +870,20 @@ function mergeDerivedWorkLogEntries(
   const requestKind = next.requestKind ?? previous.requestKind;
   const collapseKey = next[workLogCollapseKey] ?? previous[workLogCollapseKey];
   const toolCallId = next.toolCallId ?? previous.toolCallId;
-  const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
+  const previousStatus = recordedCommandStatus(previous);
+  const toolLifecycleStatus =
+    previousStatus === "failed" || previousStatus === "declined" || previousStatus === "stopped"
+      ? previousStatus
+      : (next.toolLifecycleStatus ?? previous.toolLifecycleStatus);
   const toolData = next.toolData ?? previous.toolData;
+  const exitCode =
+    previous.exitCode !== undefined && previous.exitCode !== 0
+      ? previous.exitCode
+      : (next.exitCode ?? previous.exitCode);
   return {
     ...previous,
     ...next,
+    ...(exitCode !== undefined ? { exitCode } : {}),
     ...(detail ? { detail } : {}),
     ...(viewedImagePath ? { viewedImagePath } : {}),
     ...(command ? { command } : {}),
@@ -1214,6 +1232,18 @@ function summarizeToolRawOutput(payload: Record<string, unknown> | null): string
   return null;
 }
 
+/** Structured field first, then the provider's own trailing exit marker. Never assistant prose. */
+function extractCommandExitCode(payload: Record<string, unknown> | null): number | undefined {
+  const structured = structuredCommandExitCode(payload?.data);
+  if (structured !== undefined) return structured;
+  const detail = asTrimmedString(payload?.detail);
+  const output = extractCommandOutputText(payload?.data);
+  return (
+    (detail ? stripTrailingExitCode(detail).exitCode : undefined) ??
+    (output ? stripTrailingExitCode(output).exitCode : undefined)
+  );
+}
+
 function extractToolOutput(payload: Record<string, unknown> | null): string | null {
   const output = extractCommandOutputText(payload?.data);
   return output ? stripTrailingExitCode(output).output : null;
@@ -1297,7 +1327,7 @@ function stripTrailingExitCode(value: string): {
   const normalizedOutput = match.groups.output?.trim() ?? "";
   return {
     output: normalizedOutput.length > 0 ? normalizedOutput : null,
-    ...(Number.isInteger(exitCode) ? { exitCode } : {}),
+    ...(Number.isSafeInteger(exitCode) ? { exitCode } : {}),
   };
 }
 

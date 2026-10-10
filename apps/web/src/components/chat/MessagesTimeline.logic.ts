@@ -38,6 +38,11 @@ import {
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
 import { formatWorkspaceRelativePath } from "../../filePathDisplay";
+import {
+  deriveTaskResultsByAssistantMessageId,
+  taskResultsEqual,
+  type TaskResult,
+} from "./TaskResult.logic";
 
 const TIMELINE_MINIMAP_ITEM_SPACING = 8;
 export const TIMELINE_MINIMAP_MIN_ITEMS = 2;
@@ -415,6 +420,7 @@ export type MessagesTimelineRow =
       showAssistantCopyButton: boolean;
       assistantCopyStreaming: boolean;
       assistantTurnDiffSummary?: TurnDiffSummary | undefined;
+      assistantTaskResult?: TaskResult | undefined;
       revertTurnCount?: number | undefined;
     }
   | {
@@ -1010,6 +1016,13 @@ export function deriveMessagesTimelineRows(input: {
     latestTurn: input.latestTurn ?? null,
     unfoldedTurnIds: activeVisualResponseTurnIds,
   });
+  const taskResultByAssistantMessageId = deriveTaskResultsByAssistantMessageId({
+    timelineEntries: input.timelineEntries,
+    terminalAssistantMessageIds,
+    activeTurnIds: activeVisualResponseTurnIds,
+    latestTurn: input.latestTurn ?? null,
+    turnDiffSummaryByAssistantMessageId,
+  });
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
     if (!input.expandedTurnIds?.has(fold.turnId)) {
@@ -1404,6 +1417,7 @@ export function deriveMessagesTimelineRows(input: {
         timelineEntry.message.role === "assistant"
           ? turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id)
           : undefined,
+      assistantTaskResult: taskResultByAssistantMessageId.get(timelineEntry.message.id),
       revertTurnCount:
         timelineEntry.message.role === "user"
           ? revertTurnCountByUserMessageId.get(timelineEntry.message.id)
@@ -1689,6 +1703,7 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.showAssistantCopyButton === bm.showAssistantCopyButton &&
         a.assistantCopyStreaming === bm.assistantCopyStreaming &&
         a.assistantTurnDiffSummary === bm.assistantTurnDiffSummary &&
+        taskResultsEqual(a.assistantTaskResult, bm.assistantTaskResult) &&
         a.revertTurnCount === bm.revertTurnCount
       );
     }

@@ -108,6 +108,15 @@ import {
 } from "../../native/SelectableMarkdownText";
 
 import { AppText as Text } from "../../components/AppText";
+import {
+  deriveTaskResults,
+  type TaskResult,
+  type RecordedVisual,
+} from "@t3tools/client-runtime/task-results";
+import { TaskResultCard } from "./TaskResultCard";
+import { useEnvironmentThread } from "../../state/threads";
+import { setReviewSelectedSectionId } from "../review/reviewState";
+import { getReviewSectionIdForCheckpoint } from "../review/reviewModel";
 import { VideoPreviewModal, type VideoPreviewSource } from "../../components/VideoPreviewModal";
 import { VideoAttachmentTile } from "../../components/VideoAttachmentTile";
 import { MediaVideoPlayer } from "../../components/MediaVideoPlayer";
@@ -1366,6 +1375,9 @@ function renderFeedEntry(
     readonly workRowSizing: ReturnType<typeof deriveThreadWorkLogSizing>;
     readonly workGroupScrollPositions: Map<string, ThreadWorkGroupScrollPosition>;
     readonly terminalAssistantMessageIds: ReadonlySet<string>;
+    readonly taskResultsByMessageId: ReadonlyMap<string, TaskResult>;
+    readonly onOpenResultVisual: (visual: RecordedVisual) => void;
+    readonly onOpenResultDiff: (turnId: string) => void;
     readonly unsettledTurnId: TurnId | null;
     readonly isWorking: boolean;
     readonly onCopyWorkRow: (rowId: string, value: string) => void;
@@ -1675,13 +1687,24 @@ function renderFeedEntry(
               />
             ) : null}
           </View>
+          {props.taskResultsByMessageId.get(message.id) ? (
+            <TaskResultCard
+              result={props.taskResultsByMessageId.get(message.id)!}
+              onOpenVisual={props.onOpenResultVisual}
+              onOpenDiff={props.onOpenResultDiff}
+            />
+          ) : null}
         </View>
       );
     }
 
     // Skip empty assistant messages (no text, no attachments) — they would
     // render as an orphaned timestamp and break adjacent activity-group merging.
-    if (renderedText.trim().length === 0 && attachments.length === 0) {
+    if (
+      renderedText.trim().length === 0 &&
+      attachments.length === 0 &&
+      !props.taskResultsByMessageId.has(message.id)
+    ) {
       return null;
     }
 
@@ -1730,6 +1753,13 @@ function renderFeedEntry(
             <MessageAttachmentUnknown key={attachment.id} name={attachment.name} />
           );
         })}
+        {props.taskResultsByMessageId.get(message.id) ? (
+          <TaskResultCard
+            result={props.taskResultsByMessageId.get(message.id)!}
+            onOpenVisual={props.onOpenResultVisual}
+            onOpenDiff={props.onOpenResultDiff}
+          />
+        ) : null}
         {showAssistantMeta ? (
           <View className="mt-1 flex-row items-center gap-1">
             <CopyTextButton
@@ -1949,6 +1979,8 @@ function ThreadFeedPlaceholder(props: {
 
 export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const navigation = useNavigation();
+  const threadState = useEnvironmentThread(props.environmentId, props.threadId);
+  const checkpoints = Option.getOrNull(threadState.data)?.checkpoints;
   const { themeAppearance } = useAppearancePreferences();
   const copyFeedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disclosureSettleFrameRef = useRef<number | null>(null);
@@ -2507,6 +2539,22 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     }
     return new Set(terminalIdsByTurn.values());
   }, [props.feed]);
+  const taskResultsByMessageId = useMemo(
+    () =>
+      deriveTaskResults({
+        workEntries: props.feed.flatMap((entry) =>
+          entry.type === "activity-group" ? entry.activities.map((a) => a.workEntry) : [],
+        ),
+        messages: props.feed.flatMap((entry) => (entry.type === "message" ? [entry.message] : [])),
+        terminalAssistantMessageIds,
+        activeTurnIds: new Set(unsettledTurnId ? [unsettledTurnId] : []),
+        latestTurn: props.latestTurn ?? null,
+        changedFileCountByTurnId: new Map(
+          checkpoints?.map((checkpoint) => [checkpoint.turnId, checkpoint.files.length]),
+        ),
+      }),
+    [props.feed, terminalAssistantMessageIds, unsettledTurnId, props.latestTurn, checkpoints],
+  );
   useEffect(() => {
     const previous = previousLatestTurnRef.current;
     previousLatestTurnRef.current = props.latestTurn;
@@ -2695,6 +2743,39 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const onPressPreview = useCallback((source: FilePreviewSource) => {
     setExpandedFile((current) => current ?? source);
   }, []);
+  const onOpenResultVisual = useCallback(
+    (visual: RecordedVisual) => {
+      const media = resolveMarkdownMediaPreview(visual.path, {
+        environmentId: props.environmentId,
+        threadId: props.threadId,
+        workspaceRoot: props.workspaceRoot,
+      });
+      if (media?.kind === "video") setExpandedVideo((current) => current ?? media.source);
+      else if (media) setExpandedFile((current) => current ?? media.source);
+      else onMarkdownLinkPress(visual.path);
+    },
+    [props.environmentId, props.threadId, props.workspaceRoot, onMarkdownLinkPress],
+  );
+  const onOpenResultDiff = useCallback(
+    (turnId: string) => {
+      const checkpoint = checkpoints?.find(
+        (checkpoint) => checkpoint.turnId === turnId && checkpoint.status === "ready",
+      );
+      if (!checkpoint) {
+        Alert.alert("Diff unavailable", "This turn's checkpoint is not available.");
+        return;
+      }
+      setReviewSelectedSectionId(
+        scopedThreadKey(props.environmentId, props.threadId),
+        getReviewSectionIdForCheckpoint(checkpoint),
+      );
+      navigation.navigate("ThreadReview", {
+        environmentId: props.environmentId,
+        threadId: props.threadId,
+      });
+    },
+    [checkpoints, props.environmentId, props.threadId, navigation],
+  );
   const onPressVideo = useCallback(
     (attachment: ChatFileAttachment, sourceIdentifier: string) => {
       setExpandedVideo(
@@ -2763,6 +2844,9 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             workRowSizing,
             workGroupScrollPositions,
             terminalAssistantMessageIds,
+            taskResultsByMessageId,
+            onOpenResultVisual,
+            onOpenResultDiff,
             unsettledTurnId,
             isWorking: props.activeWorkStartedAt !== null,
             onCopyWorkRow,
@@ -2809,6 +2893,9 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       workRowSizing,
       workGroupScrollPositions,
       terminalAssistantMessageIds,
+      taskResultsByMessageId,
+      onOpenResultVisual,
+      onOpenResultDiff,
       unsettledTurnId,
       props.activeWorkStartedAt,
       iconSubtleColor,

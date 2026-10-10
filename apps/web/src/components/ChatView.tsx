@@ -46,7 +46,12 @@ import {
   TerminalOpenInput,
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
-import { type EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
+import {
+  connectionWaitingDescription,
+  latestRecoveryNote,
+  resolveThreadRunStatus,
+  type EnvironmentConnectionPresentation,
+} from "@t3tools/client-runtime/connection";
 import {
   wasBootstrapThreadDeleted,
   wasBootstrapThreadNotCreated,
@@ -238,11 +243,13 @@ import {
   ChevronDownIcon,
   DownloadIcon,
   GitBranchIcon,
+  InfoIcon,
   Minimize2Icon,
   PaperclipIcon,
   WifiOffIcon,
 } from "lucide-react";
 import { cn, randomHex, randomUUID } from "~/lib/utils";
+import { formatUpcomingTimestamp } from "../timestampFormat";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
 import { type NewProjectScriptInput } from "./ProjectScriptsControl";
@@ -2717,6 +2724,7 @@ export default function ChatView(props: ChatViewProps) {
         variant: unavailableConnection.phase === "error" ? "error" : "warning",
         icon: <WifiOffIcon />,
         title: `${activeEnvironmentUnavailableState.label} is ${environmentReconnecting ? "reconnecting" : "offline"}`,
+        description: connectionWaitingDescription(unavailableConnection),
         actions: (
           <>
             {!environmentReconnecting ? (
@@ -6508,6 +6516,50 @@ export default function ChatView(props: ChatViewProps) {
       }),
     [feedbackSubmissions, routeThreadKey],
   );
+  const threadRunStatus = useMemo(
+    () =>
+      resolveThreadRunStatus({
+        connected: activeEnvironment !== null && !activeEnvironmentUnavailable,
+        machineLabel: hasMultipleRegisteredEnvironments ? (activeEnvironment?.label ?? null) : null,
+        providerLabel: conversationProviderStatus
+          ? (conversationProviderStatus.displayName ?? null)
+          : null,
+        accountLabel: conversationProviderStatus?.auth.email ?? null,
+        providerAuth: conversationProviderStatus?.auth.status ?? null,
+        providerBannerVisible: visibleProviderStatus !== null,
+        pendingApprovalCount: pendingApprovals.length,
+        pendingQuestionCount: pendingUserInputs.length,
+        recovery: latestRecoveryNote(threadActivities, activeLatestTurn),
+        formatTime: (iso) => formatUpcomingTimestamp(iso, timestampFormat),
+      }),
+    [
+      activeEnvironment,
+      activeEnvironmentUnavailable,
+      conversationProviderStatus,
+      hasMultipleRegisteredEnvironments,
+      pendingApprovals.length,
+      pendingUserInputs.length,
+      threadActivities,
+      activeLatestTurn,
+      timestampFormat,
+      visibleProviderStatus,
+    ],
+  );
+  const threadRunStatusItems = useMemo<ComposerBannerStackItem[]>(
+    () =>
+      threadRunStatus === null
+        ? []
+        : [
+            {
+              id: `thread-run-status:${threadRunStatus.cause}`,
+              variant: threadRunStatus.variant,
+              icon: <InfoIcon />,
+              title: threadRunStatus.title,
+              description: threadRunStatus.description,
+            },
+          ],
+    [threadRunStatus],
+  );
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const backgroundLivenessItems =
       backgroundLivenessBannerItem === null ? [] : [backgroundLivenessBannerItem];
@@ -6524,6 +6576,7 @@ export default function ChatView(props: ChatViewProps) {
         ...usageLimitsItems,
         ...projectCloneItems,
         ...systemComposerBannerItems,
+        ...threadRunStatusItems,
         ...backgroundLivenessItems,
         ...resumeCompactionItems,
         ...wokeThreadItems,
@@ -6535,6 +6588,7 @@ export default function ChatView(props: ChatViewProps) {
       ...usageLimitsItems,
       ...projectCloneItems,
       ...systemComposerBannerItems,
+      ...threadRunStatusItems,
       ...backgroundLivenessItems,
       ...resumeCompactionItems,
       ...wokeThreadItems,
@@ -6590,6 +6644,7 @@ export default function ChatView(props: ChatViewProps) {
     resumeCompactionBannerItem,
     showBranchMismatchBanner,
     systemComposerBannerItems,
+    threadRunStatusItems,
     usageLimitsBanner,
     wokeThreadBannerItem,
   ]);

@@ -154,6 +154,7 @@ import {
 } from "./SnapShotAttachmentDetails";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesCard } from "./ChangedFilesTree";
+import { TaskResultCard } from "./TaskResultCard";
 import { useAtomValue } from "@effect/atom-react";
 import { useFileContextMenuHandler } from "../../fileContextMenu";
 import { useProject, useThread } from "../../state/entities";
@@ -2259,6 +2260,14 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           </div>
         </div>
       </div>
+      {row.assistantTaskResult ? (
+        <TaskResultCard
+          result={row.assistantTaskResult}
+          cwd={ctx.markdownCwd}
+          threadRef={ctx.threadRef ?? undefined}
+          onImageExpand={ctx.onImageExpand}
+        />
+      ) : null}
     </div>
   );
 }
@@ -2412,6 +2421,14 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           resolvedTheme={ctx.resolvedTheme}
           onOpenTurnDiff={ctx.onOpenTurnDiff}
         />
+        {row.assistantTaskResult ? (
+          <TaskResultCard
+            result={row.assistantTaskResult}
+            cwd={ctx.markdownCwd}
+            threadRef={ctx.threadRef ?? undefined}
+            onImageExpand={ctx.onImageExpand}
+          />
+        ) : null}
         {row.showAssistantMeta ? (
           <AssistantMessageMeta
             className="mt-1.5"

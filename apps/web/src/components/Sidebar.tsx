@@ -384,6 +384,8 @@ function SidebarThreadTooltip({
   branchMismatch,
   terminalStatus,
   terminalProcessCount,
+  isPinned,
+  legacyPullRequestBadge,
 }: {
   thread: SidebarThreadSummary;
   project: ProjectFaviconProject | null;
@@ -400,6 +402,8 @@ function SidebarThreadTooltip({
   } | null;
   terminalStatus: TerminalStatusIndicator | null;
   terminalProcessCount: number;
+  isPinned?: boolean;
+  legacyPullRequestBadge?: ReactNode;
 }) {
   const driverKind = providerEntry?.driverKind ?? null;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
@@ -407,10 +411,12 @@ function SidebarThreadTooltip({
     <TooltipPopup side="right" align="start" sideOffset={4} variant="glass">
       {/* The viewport's own inset (py-1 px-2) plus this one make the floating inset. */}
       <div className="flex min-w-0 max-w-80 flex-col gap-2 px-1 py-2">
-        <div className="min-w-0 truncate text-xs leading-tight font-medium text-foreground">
+        <div className="min-w-0 text-xs leading-tight font-medium wrap-break-word text-foreground">
           {thread.title}
         </div>
         <div className="grid gap-1.5 pl-0.5 text-xs text-muted-foreground">
+          <div>{threadTimeLabel(thread)}</div>
+          {isPinned ? <div>Pinned</div> : null}
           {projectDisplayName ? (
             <div className="flex min-w-0 items-center gap-2">
               {project ? <ProjectFavicon project={project} className="size-3 shrink-0" /> : null}
@@ -482,6 +488,11 @@ function SidebarThreadTooltip({
         {supportsMultiplePullRequests && thread.pullRequests.length > 0 ? (
           <div className="border-t border-border/60 pt-2 pl-0.5 text-xs text-muted-foreground">
             <ThreadPullRequestsMiniList pullRequests={thread.pullRequests} />
+          </div>
+        ) : null}
+        {legacyPullRequestBadge ? (
+          <div className="pointer-events-auto border-t border-border/60 pt-2 pl-0.5">
+            {legacyPullRequestBadge}
           </div>
         ) : null}
       </div>
@@ -790,8 +801,8 @@ function SidebarInboxGroupHeader(props: {
   );
 }
 
-// One unsent draft session the user has invested content in. Two lines,
-// nothing else: the typed prompt, then project name. All the draft's
+// One unsent draft session: prompt and project share the same compact line.
+// All the draft's
 // settings (model, env mode, branch, worktree) still travel with it —
 // clicking is a plain navigation to /draft/$draftId, which touches nothing.
 // While the draft is open the row renders a frozen snapshot (see
@@ -854,54 +865,64 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   );
   return (
     <li className="list-none py-0.5">
-      <div
-        role="button"
-        tabIndex={0}
-        aria-label={accessibility.label}
-        aria-current={accessibility.current}
-        data-testid="sidebar-draft-row"
-        className={cn(
-          "group/sidebar-row relative w-full cursor-pointer overflow-hidden rounded-md text-left text-sidebar-foreground outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-          props.isActive ? "bg-sidebar-row-active" : draftSurfaceClassName,
-        )}
-        onClick={handleActivate}
-        onKeyDown={handleKeyDown}
-      >
-        <span className="sr-only">{preview}</span>
-        <div className="relative z-10 h-[3.375rem] px-(--sidebar-row-content-inset) py-1.75">
-          <div aria-hidden className="flex h-5 min-w-0 items-center gap-1.5">
-            <SquarePenIcon aria-hidden className={draftPenClassName} />
-            <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground/90">
-              {preview}
-            </span>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <div
+              role="button"
+              tabIndex={0}
+              aria-label={accessibility.label}
+              aria-current={accessibility.current}
+              data-testid="sidebar-draft-row"
+              className={cn(
+                "group/sidebar-row relative w-full cursor-pointer overflow-hidden rounded-md text-left text-sidebar-foreground outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                props.isActive ? "bg-sidebar-row-active" : draftSurfaceClassName,
+              )}
+              onClick={handleActivate}
+              onKeyDown={handleKeyDown}
+            />
+          }
+        >
+          <span className="sr-only">{preview}</span>
+          <div className="relative z-10 flex h-9 min-w-0 items-center gap-1.5 px-(--sidebar-row-content-inset)">
+            <div aria-hidden className="flex min-w-0 flex-1 items-center gap-1.5">
+              <SquarePenIcon aria-hidden className={draftPenClassName} />
+              <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground/90">
+                {preview}
+              </span>
+            </div>
+            <div className="flex h-5 min-w-0 max-w-[40%] items-center gap-1.5">
+              {props.project ? (
+                <ProjectFavicon project={props.project} className="size-4 shrink-0" />
+              ) : null}
+              <span className="min-w-0 flex-1 truncate text-xs font-medium text-secondary-label">
+                {props.projectDisplayName}
+              </span>
+              <span className="ml-auto flex h-5 min-w-5 shrink-0 items-center justify-end">
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <button
+                        type="button"
+                        aria-label="Discard draft"
+                        onClick={handleDiscard}
+                        className="pointer-events-none inline-flex cursor-pointer items-center rounded-md bg-transparent px-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100"
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    }
+                  />
+                  <TooltipPopup side="top">Discard draft</TooltipPopup>
+                </Tooltip>
+              </span>
+            </div>
           </div>
-          <div className="flex h-5 min-w-0 items-center gap-1.5">
-            {props.project ? (
-              <ProjectFavicon project={props.project} className="size-4 shrink-0" />
-            ) : null}
-            <span className="min-w-0 flex-1 truncate text-xs font-medium text-secondary-label">
-              {props.projectDisplayName}
-            </span>
-            <span className="ml-auto flex h-5 min-w-5 shrink-0 items-center justify-end">
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <button
-                      type="button"
-                      aria-label="Discard draft"
-                      onClick={handleDiscard}
-                      className="pointer-events-none inline-flex cursor-pointer items-center rounded-md bg-transparent px-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100"
-                    >
-                      <XIcon className="size-3" />
-                    </button>
-                  }
-                />
-                <TooltipPopup side="top">Discard draft</TooltipPopup>
-              </Tooltip>
-            </span>
-          </div>
-        </div>
-      </div>
+        </TooltipTrigger>
+        <TooltipPopup side="right" align="start">
+          <div className="max-w-80 wrap-break-word">{preview}</div>
+          <div>{props.projectDisplayName}</div>
+        </TooltipPopup>
+      </Tooltip>
     </li>
   );
 });
@@ -1311,23 +1332,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   // different machines apart.
   const isRemote = thread.environmentId !== props.currentEnvironmentId;
 
-  const detailsTooltip = (
-    <SidebarThreadTooltip
-      thread={thread}
-      project={props.project}
-      projectDisplayName={props.projectDisplayName}
-      environmentLabel={props.environmentLabel}
-      environmentMachine={props.environmentMachine}
-      providerEntry={providerEntry}
-      showInstanceBadge={showInstanceBadge}
-      modelInstanceId={modelInstanceId}
-      modelLabel={modelLabel}
-      branchMismatch={branchMismatch}
-      terminalStatus={terminalStatus}
-      terminalProcessCount={terminalProcessCount}
-    />
-  );
-
   const handleClick = useCallback(
     (event: ReactMouseEvent) => {
       onThreadClick(event, threadRef);
@@ -1501,7 +1505,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   // a useful hierarchy nor a reliable hover cue. Status now lives in the row
   // content; surface is reserved for interaction (hover, multi-select, route).
   const rowSurfaceClassName = cn(
-    "group/sidebar-row relative w-full cursor-pointer overflow-hidden rounded-md text-left outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+    "@container/thread-row group/sidebar-row relative w-full cursor-pointer overflow-hidden rounded-md text-left outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
     variantAction === "unsettle" && "[&:not(:hover):not(:focus-within)_*]:text-secondary-label/70",
     props.isActive
       ? "bg-sidebar-row-active text-sidebar-foreground"
@@ -1580,7 +1584,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     <span
       aria-hidden
       className={cn(
-        "min-w-0 flex-1 text-sm transition-opacity motion-reduce:transition-none",
+        "min-w-8 flex-1 text-sm transition-opacity motion-reduce:transition-none",
         shouldRecede ? "font-normal" : "font-medium",
         variant === "card"
           ? cn(
@@ -1646,6 +1650,24 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       />
     </span>
   ) : null;
+  const detailsTooltip = (
+    <SidebarThreadTooltip
+      thread={thread}
+      project={props.project}
+      projectDisplayName={props.projectDisplayName}
+      environmentLabel={props.environmentLabel}
+      environmentMachine={props.environmentMachine}
+      providerEntry={providerEntry}
+      showInstanceBadge={showInstanceBadge}
+      modelInstanceId={modelInstanceId}
+      modelLabel={modelLabel}
+      branchMismatch={branchMismatch}
+      terminalStatus={terminalStatus}
+      terminalProcessCount={terminalProcessCount}
+      isPinned={props.isPinned}
+      legacyPullRequestBadge={prBadge}
+    />
+  );
   // Same pen the new-thread draft rows lead with, so both kinds of unsent
   // work read the same way in the list.
   const draftIndicator = hasUnsentDraft ? (
@@ -1856,8 +1878,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       {...sortableRootProps}
       {...(fileDropHandlers ?? {})}
       className={cn(
-        // Matches the h-[3.375rem] content box; the py-0.5 padding is added on top.
-        "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_54px]",
+        "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_36px]",
         sortable?.isDragging && "relative z-20",
       )}
     >
@@ -1881,12 +1902,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           }
         >
           {accessibleTitle}
-          {/* Two 20px lines. The first owns the title, its optional badges, the
-              pin and the hover actions; the second is metadata and status only,
-              so hover controls do not crowd the metadata. 7px padding (not
-              the 8px inset) makes 54px. */}
-          <div className="relative z-10 h-[3.375rem] px-(--sidebar-row-content-inset) py-1.75">
-            <div className="relative flex h-5 min-w-0 items-center gap-1.5">
+          {/* One line; the title and metadata yield space to status and controls.
+              The existing tooltip keeps the full title, project and branch. */}
+          <div className="relative z-10 flex h-9 min-w-0 items-center gap-0.5 px-(--sidebar-row-content-inset) @min-[240px]/thread-row:gap-1 @min-[320px]/thread-row:gap-1.5">
+            <div className="contents">
               {draftIndicator}
               {title}
               {isRegeneratingTitle ? (
@@ -1894,15 +1913,17 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   Regenerating title
                 </span>
               ) : null}
-              {terminalStatusIcon}
-              {prBadge}
-              {diff ? (
-                <span className="shrink-0 font-mono text-xs">
-                  <span className="text-diff-addition-foreground">+{diff.insertions}</span>{" "}
-                  <span className="text-diff-deletion-foreground">−{diff.deletions}</span>
-                </span>
-              ) : null}
-              {pinIndicator}
+              <span className="hidden shrink-0 items-center gap-1.5 @min-[480px]/thread-row:inline-flex">
+                {terminalStatusIcon}
+                {prBadge}
+                {diff ? (
+                  <span className="shrink-0 font-mono text-xs">
+                    <span className="text-diff-addition-foreground">+{diff.insertions}</span>{" "}
+                    <span className="text-diff-deletion-foreground">−{diff.deletions}</span>
+                  </span>
+                ) : null}
+                {pinIndicator}
+              </span>
               {/* Actions sit out of flow and invisible at rest; on hover or their
                   own focus-visible they enter the flow and the title yields the
                   width. focus-visible, not focus-within: a mouse click leaves
@@ -1911,7 +1932,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
               (props.settlementSupported || showSnoozeButton || hasUnsentDraft) ? (
                 <span
                   className={cn(
-                    "pointer-events-none absolute inset-y-0 right-0 flex shrink-0 items-stretch opacity-0 transition-opacity has-[:focus-visible]:pointer-events-auto has-[:focus-visible]:static has-[:focus-visible]:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:static group-hover/sidebar-row:opacity-100",
+                    "pointer-events-none absolute inset-y-0 right-0 flex shrink-0 items-stretch opacity-0 transition-opacity [&_button]:px-1 has-[:focus-visible]:pointer-events-auto has-[:focus-visible]:static has-[:focus-visible]:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:static group-hover/sidebar-row:opacity-100",
                     snoozeMenuOpen && "pointer-events-auto static opacity-100",
                   )}
                 >
@@ -1953,7 +1974,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                         }
                       >
                         <CheckIcon className="size-3.5" />
-                        Settle
                       </TooltipTrigger>
                       <TooltipPopup>Settle thread</TooltipPopup>
                     </Tooltip>
@@ -1961,8 +1981,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 </span>
               ) : null}
             </div>
-            <div className="flex h-5 min-w-0 items-center gap-1.5 text-secondary-label text-xs">
-              <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+            <div className="contents text-secondary-label text-xs">
+              <div className="flex min-w-0 max-w-[32%] flex-1 items-center gap-1 overflow-hidden group-hover/sidebar-row:hidden group-has-[:focus-visible]/sidebar-row:hidden @min-[320px]/thread-row:group-hover/sidebar-row:flex @min-[320px]/thread-row:group-has-[:focus-visible]/sidebar-row:flex">
                 {props.project ? (
                   <ProjectFavicon project={props.project} className="size-4 shrink-0" />
                 ) : null}
@@ -1994,9 +2014,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   </>
                 ) : null}
               </div>
-              {/* Status or time stays visible: hover actions live on the title
-                  line, so nothing here cross-fades. Woke is itself an action and
-                  stays pointer-enabled. */}
+              {/* Status stays visible while the title yields to hover actions. */}
               {sortable?.isDragging ? (
                 dragDestination
               ) : (
@@ -2016,7 +2034,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                               )}
                             >
                               <AlarmClockIcon aria-hidden className="size-4 shrink-0" />
-                              <span role="status">{topStatus.label}</span>
+                              <span
+                                role="status"
+                                className="sr-only @min-[320px]/thread-row:not-sr-only"
+                              >
+                                {topStatus.label}
+                              </span>
                             </button>
                           }
                         />
@@ -2045,16 +2068,23 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                         {/* The label alone is the live region: a role="status"
                           wrapper around the ticking duration would make
                           screen readers announce every second. */}
-                        <span role="status">{topStatus.label}</span>
+                        <span role="status" className="sr-only @min-[320px]/thread-row:not-sr-only">
+                          {topStatus.label}
+                        </span>
                         {status === "working" ? (
-                          <span aria-hidden>
+                          <span aria-hidden className="hidden @min-[320px]/thread-row:inline">
                             <WorkingDuration startedAt={resolveWorkingStartedAt(thread)} />
                           </span>
                         ) : null}
                       </span>
                     )
                   ) : (
-                    threadTimeLabel(thread)
+                    <>
+                      <ClockIcon aria-hidden className="size-3.5 @min-[320px]/thread-row:hidden" />
+                      <span className="sr-only @min-[320px]/thread-row:not-sr-only">
+                        {threadTimeLabel(thread)}
+                      </span>
+                    </>
                   )}
                 </span>
               )}

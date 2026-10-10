@@ -6,6 +6,34 @@ import type {
 } from "@t3tools/contracts";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
+import { isWindowsAbsolutePath } from "@t3tools/shared/path";
+import { videoMimeType } from "@t3tools/shared/video";
+
+/** Extract subprocess evidence before discarding output; never read wrapper status or usage. */
+function commandExitCode(data: Record<string, unknown>, detail?: unknown): number | undefined {
+  const item = asRecord(data.item);
+  const result = asRecord(item?.result ?? data.result);
+  const raw = asRecord(data.rawOutput);
+  for (const holder of [item, result, raw]) {
+    for (const value of [holder?.exitCode, holder?.exit_code]) {
+      if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+    }
+  }
+  for (const text of [
+    detail,
+    item?.aggregatedOutput,
+    extractMcpResultText(result),
+    data.rawOutput,
+    raw?.content,
+    raw?.stdout,
+    raw?.stderr,
+  ]) {
+    if (typeof text !== "string") continue;
+    const match = /<exited with exit code (-?\d+)>\s*$/i.exec(text);
+    if (match && Number.isSafeInteger(Number(match[1]))) return Number(match[1]);
+  }
+  return undefined;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -253,23 +281,31 @@ function projectPreviewToolMetadata(data: Record<string, unknown>, status: unkno
     )
   )
     return {};
+  const metadata: {
+    toolIcon?: { _tag: "website"; pageUrl: string };
+    result?: Record<string, unknown>;
+  } = /preview_(?:snapshot|recording_stop)$/.test(name) ? { result: {} } : {};
   const state = asRecord(data.state);
   const result = item?.result ?? data.result ?? state?.output;
   const record = asRecord(result);
   if (
     status === "failed" ||
     status === "declined" ||
+    status === "stopped" ||
+    item?.status === "failed" ||
+    item?.status === "declined" ||
+    item?.status === "stopped" ||
     state?.status === "error" ||
     item?.error != null ||
     record?.isError === true ||
     record?.is_error === true
   )
-    return {};
+    return metadata;
 
   let page = record;
   let output: unknown = result;
   for (let depth = 0; depth < 3; depth += 1) {
-    if (page?.isError === true || page?.is_error === true) return {};
+    if (page?.isError === true || page?.is_error === true) return metadata;
     const structured = asRecord(page?.structuredContent);
     if (structured) {
       page = structured;
@@ -282,27 +318,53 @@ function projectPreviewToolMetadata(data: Record<string, unknown>, status: unkno
     } catch {
       // A truncated MCP envelope can still contain a complete first text block.
       const firstBlock = /^\s*\{\s*"content"\s*:\s*\[\s*/.exec(text);
-      if (!firstBlock) return {};
+      if (!firstBlock) return metadata;
       try {
         const block = asRecord(JSON.parse(extractJsonObject(text.slice(firstBlock[0].length))));
         page = block?.type === "text" ? { content: [block] } : null;
       } catch {
-        return {};
+        return metadata;
       }
     }
     output = page;
+  }
+  if (page?.isError === true || page?.is_error === true) return metadata;
+  const path = name.endsWith("preview_snapshot") ? page?.screenshotPath : page?.path;
+  if (
+    status === "completed" &&
+    typeof path === "string" &&
+    path.length <= 1024 &&
+    // oxlint-disable-next-line no-control-regex -- Provider paths must reject control bytes.
+    !/[\x00-\x1f?#]/.test(path) &&
+    !path.startsWith("//") &&
+    !path.startsWith("\\\\") &&
+    (path.startsWith("/") || isWindowsAbsolutePath(path))
+  ) {
+    if (name.endsWith("preview_snapshot") && isWorkspaceImagePreviewPath(path)) {
+      metadata.result = { structuredContent: { screenshotPath: path } };
+    } else if (
+      name.endsWith("preview_recording_stop") &&
+      videoMimeType({ name: path, mimeType: "" }) === page?.mimeType &&
+      page?.mimeType
+    ) {
+      metadata.result = { structuredContent: { path, mimeType: page.mimeType } };
+    }
   }
   const rawUrl = asTrimmedString(
     asRecord(page?.toolIcon)?.pageUrl ??
       (/preview_(?:open|navigate|status|snapshot)$/.test(name) ? page?.url : undefined),
   );
-  if (!rawUrl || rawUrl.length > 4096) return {};
+  if (!rawUrl || rawUrl.length > 4096) return metadata;
   try {
     const url = new URL(rawUrl);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return {};
-    return { toolIcon: { _tag: "website", pageUrl: url.href } };
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password)
+      return metadata;
+    url.search = "";
+    url.hash = "";
+    metadata.toolIcon = { _tag: "website", pageUrl: url.href };
+    return metadata;
   } catch {
-    return {};
+    return metadata;
   }
 }
 
@@ -312,7 +374,10 @@ function projectPreviewToolMetadata(data: Record<string, unknown>, status: unkno
  * keep the expanded-row UI working. Keep the fields the UI actually renders
  * and summarize the result like regular tool output.
  */
-function projectMcpToolCallData(data: Record<string, unknown>): Record<string, unknown> {
+function projectMcpToolCallData(
+  data: Record<string, unknown>,
+  previewResult?: Record<string, unknown>,
+): Record<string, unknown> {
   const projectedData: Record<string, unknown> = {};
 
   const item = asRecord(data.item);
@@ -323,7 +388,7 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
         projectedItem[key] = item[key];
       }
     }
-    const result = summarizeMcpResult(item.result);
+    const result = previewResult ?? summarizeMcpResult(item.result);
     if (result) {
       projectedItem.result = result;
     }
@@ -337,7 +402,7 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
     projectedData.input = data.input;
   }
   if (!item) {
-    const result = summarizeMcpResult(data.result);
+    const result = previewResult ?? summarizeMcpResult(data.result);
     if (result) {
       projectedData.result = result;
     }
@@ -433,11 +498,13 @@ export function projectActivityPayload(
 
   const itemStatus = asRecord(data.item)?.status;
   const statusPayload =
-    payload.status === "completed" && (itemStatus === "failed" || itemStatus === "declined")
+    payload.status === "completed" &&
+    (itemStatus === "failed" || itemStatus === "declined" || itemStatus === "stopped")
       ? { ...payload, status: itemStatus }
       : payload;
+  const preview = projectPreviewToolMetadata(data, statusPayload.status);
   const projectedPayload = {
-    ...projectPreviewToolMetadata(data, statusPayload.status),
+    ...(preview.toolIcon ? { toolIcon: preview.toolIcon } : {}),
     ...statusPayload,
   };
   const questionInput = projectQuestionToolInput(data, payload.title);
@@ -447,7 +514,7 @@ export function projectActivityPayload(
       ...activity,
       payload: {
         ...projectedPayload,
-        data: { ...projectMcpToolCallData(data), ...questionInput },
+        data: { ...projectMcpToolCallData(data, preview.result), ...questionInput },
       },
     };
   }
@@ -489,6 +556,10 @@ export function projectActivityPayload(
     (payload.itemType === "command_execution" ? summarizeMcpResult(data.result) : undefined);
   if (rawOutput) {
     projectedData.rawOutput = rawOutput;
+  }
+  if (payload.itemType === "command_execution") {
+    const exitCode = commandExitCode(data, payload.detail);
+    if (exitCode !== undefined) projectedData.rawOutput = { ...rawOutput, exitCode };
   }
 
   return {
@@ -632,6 +703,19 @@ function dropSupersededToolUpdatedActivities(
 
   return activities.filter((activity, index) => {
     if (activity.kind !== "tool.updated") {
+      return true;
+    }
+    const payload = asRecord(activity.payload);
+    const data = asRecord(payload?.data);
+    // A wrapper completion cannot supersede a terminal outcome or a subprocess exit.
+    if (
+      [payload?.status, asRecord(data?.item)?.status].some(
+        (status) => status === "failed" || status === "declined" || status === "stopped",
+      ) ||
+      (payload?.itemType === "command_execution" &&
+        data &&
+        commandExitCode(data, payload.detail) !== undefined)
+    ) {
       return true;
     }
     const identity = toolLifecycleIdentity(activity);

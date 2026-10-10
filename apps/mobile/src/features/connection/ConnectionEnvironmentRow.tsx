@@ -1,6 +1,6 @@
 import { ConnectionTraceId } from "./ConnectionTraceId";
 import { SymbolView } from "../../components/AppSymbol";
-import { connectionStatusText } from "@t3tools/client-runtime/connection";
+import { connectionStatusText, describeServerDetails } from "@t3tools/client-runtime/connection";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import { type EnvironmentId, resolveEnvironmentMachineKind } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
@@ -129,6 +129,15 @@ export function ConnectionEnvironmentRow(props: {
               ) : null}
             </Text>
           ) : null}
+          <Text
+            className="text-xs text-foreground-muted"
+            numberOfLines={props.expanded ? undefined : 1}
+          >
+            {describeServerDetails({
+              connected: props.environment.connectionState === "connected",
+              serverConfig,
+            })}
+          </Text>
         </View>
 
         <ThemedSwitch

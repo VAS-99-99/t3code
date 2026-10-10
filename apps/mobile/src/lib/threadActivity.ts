@@ -33,6 +33,10 @@ import {
   type ToolGroupSummaryKind,
   type WorkLogToolLifecycleStatus,
 } from "@t3tools/client-runtime/work-log/presentation";
+import {
+  recordedCommandStatus,
+  structuredCommandExitCode,
+} from "@t3tools/client-runtime/task-results";
 import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
 import { commandProgramName } from "@t3tools/client-runtime/work-log/command-label";
 
@@ -91,6 +95,8 @@ export interface WorkLogEntry {
   viewedImagePath?: string;
   command?: string;
   rawCommand?: string;
+  /** Command exit code the provider reported (structured field or exit marker). Absent when not reported. */
+  exitCode?: number;
   changedFiles?: ReadonlyArray<string>;
   tone: "thinking" | "tool" | "info" | "error";
   toolTitle?: string;
@@ -579,6 +585,14 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   }
   if (commandPreview.command) {
     entry.command = commandPreview.command;
+    // Structured field first, then the provider's own trailing exit marker. Never prose.
+    const exitCode =
+      structuredCommandExitCode(payload?.data) ??
+      (typeof payload?.detail === "string"
+        ? stripTrailingExitCode(payload.detail).exitCode
+        : undefined) ??
+      (commandOutput ? stripTrailingExitCode(commandOutput).exitCode : undefined);
+    if (exitCode !== undefined) entry.exitCode = exitCode;
   }
   if (commandPreview.rawCommand) {
     entry.rawCommand = commandPreview.rawCommand;
@@ -879,14 +893,23 @@ function mergeDerivedWorkLogEntries(
   const itemType = next.itemType ?? previous.itemType;
   const requestKind = next.requestKind ?? previous.requestKind;
   const collapseKey = next.collapseKey ?? previous.collapseKey;
-  const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
+  const previousStatus = recordedCommandStatus(previous);
+  const toolLifecycleStatus =
+    previousStatus === "failed" || previousStatus === "declined" || previousStatus === "stopped"
+      ? previousStatus
+      : (next.toolLifecycleStatus ?? previous.toolLifecycleStatus);
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolData = next.toolData ?? previous.toolData;
+  const exitCode =
+    previous.exitCode !== undefined && previous.exitCode !== 0
+      ? previous.exitCode
+      : (next.exitCode ?? previous.exitCode);
   return {
     ...previous,
     ...next,
     id: previous.id,
     createdAt: previous.createdAt,
+    ...(exitCode !== undefined ? { exitCode } : {}),
     ...(detail ? { detail } : {}),
     ...(viewedImagePath ? { viewedImagePath } : {}),
     ...(command ? { command } : {}),
@@ -1422,7 +1445,7 @@ function stripTrailingExitCode(value: string): {
   const normalizedOutput = match.groups.output?.trim() ?? "";
   return {
     output: normalizedOutput.length > 0 ? normalizedOutput : null,
-    ...(Number.isInteger(exitCode) ? { exitCode } : {}),
+    ...(Number.isSafeInteger(exitCode) ? { exitCode } : {}),
   };
 }
 

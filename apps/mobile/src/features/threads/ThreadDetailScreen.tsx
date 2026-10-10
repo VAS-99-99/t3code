@@ -110,6 +110,7 @@ import {
   ThreadComposer,
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
+import { ThreadRunStatus } from "./ThreadRunStatus";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
 
@@ -992,6 +993,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                     onDismiss={() => props.onDismissFeedback(submission.id)}
                   />
                 ))}
+                <ThreadRunStatus
+                  thread={props.selectedThread}
+                  serverConfig={props.serverConfig}
+                  connectionState={props.connectionStateLabel}
+                  environmentLabel={props.environmentLabel}
+                  hasPendingApproval={props.activePendingApproval !== null}
+                  hasPendingUserInput={props.activePendingUserInput !== null}
+                />
                 {usageLimitsReport && activeUserInputRequestId === null ? (
                   <Animated.View
                     className="shrink-0 px-4 pb-3"

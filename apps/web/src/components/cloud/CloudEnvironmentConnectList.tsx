@@ -1,5 +1,6 @@
 import { findErrorTraceId } from "@t3tools/client-runtime/errors";
 import {
+  describeServerDetails,
   type EnvironmentConnectionPresentation,
   RelayConnectionRegistration,
   RelayConnectionTarget,
@@ -443,6 +444,16 @@ export function CloudEnvironmentConnectRows({
               )}
             >
               {statusText}
+            </p>
+            <p className="truncate text-xs text-muted-foreground">
+              {describeServerDetails({
+                connected: savedEnvironment?.connection.phase === "connected",
+                serverConfig:
+                  savedEnvironment?.serverConfig ??
+                  (descriptor === undefined || descriptor === null
+                    ? null
+                    : { environment: descriptor }),
+              })}
             </p>
           </div>
           {unsupported && !savedEnvironment ? (
